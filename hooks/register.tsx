@@ -305,7 +305,10 @@ function addRoundTotals(current: SessionTotals, round: UsageRound): SessionTotal
  * 刷新输入框下方的状态行。
  *
  * <p>数据来源：会话累计来自 state，上下文占比来自官方 $.session.usage()。
- * 读取失败时保留旧缓存并写日志，不阻断对话。</p>
+ * 读取失败时按「无读数」处理，清空上下文缓存并写日志，不阻断对话。</p>
+ *
+ * <p>会话压缩后，宿主在新窗口产生第一次响应前不提供上下文读数；压缩完成时必须调用本函数，
+ * 否则状态行会继续显示压缩前的百分比。</p>
  */
 async function refreshStatus($: EngineInterface): Promise<void> {
   const current = await read($, totals)
@@ -451,6 +454,22 @@ function registerCollectors(on: On): void {
             }
           }
 
+          // 每次响应结束后重读宿主读数：压缩后新窗口的第一次响应一回来，上下文占比即可用，
+          // 不必等到整轮结束才恢复状态行；子代理请求不改变主会话窗口，跳过。
+          if (e.agentId === undefined) {
+            try {
+              const usage = await $.session.usage()
+              statusCache.contextPercent = usage.context.percent ?? null
+            } catch (error) {
+              $.ui.log(
+                `usage-toolbar: turn.step 结束刷新上下文失败 turn=${e.turnId} ${String(error)}`,
+                { to: 'debug' },
+              )
+            }
+            // 面板是拉取式绘制：state 写入不会自动重绘，须显式失效才会重读宿主读数。
+            $.ui.invalidate('ui.render')
+          }
+
           // 每步结束时把最终估算值推给状态行与实时快照；分母同样从首个输出块起算。
           const elapsed = endedAt - (firstOutputAt ?? startedAt)
           const finalTps = elapsed > 0 && stepChars > 0 ? stepChars / 3.5 / (elapsed / 1000) : null
@@ -501,6 +520,8 @@ function registerCollectors(on: On): void {
         await update($, ticker, () => null)
         await refreshStatus($)
         queueHistorySave($)
+        // 轮次状态写入同样不会自动重绘面板，显式失效让面板展示本轮最终值。
+        $.ui.invalidate('ui.render')
       } else {
         const agentId = e.agentId
         await update($, agentTotals, maps => {
@@ -1573,6 +1594,34 @@ function registerUi(on: On): void {
 export const register: Register = on => {
   registerCollectors(on)
   registerUi(on)
+
+  // 宿主测量推送：每轮主循环结束后与配额窗口变化时给出最新上下文与费用。
+  // 这里只同步上下文缓存并要求面板重绘，不写 state，避免干扰生成中的状态行。
+  on('session.measure', async ($, e, next) => {
+    statusCache.contextPercent = e.context.percent ?? null
+    $.ui.invalidate('ui.render')
+    return next(e)
+  })
+
+  // 会话压缩：钩子在压缩开始前触发，await next(e) 返回时压缩已完成。
+  // 压缩前的状态行缓存与已打开的面板不再代表当前窗口，宿主在新窗口第一次响应前
+  // 也不提供上下文读数；这里重读一次并按无读数处理，再要求宿主重绘面板。
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId !== undefined) {
+      // 子代理或 fork 自己的转录压缩，不影响主会话窗口，不刷新主状态行。
+      $.ui.log(`usage-toolbar: 子代理压缩不刷新主会话读数 agent=${e.agentId}`, { to: 'debug' })
+      return result
+    }
+
+    try {
+      await refreshStatus($)
+      $.ui.invalidate('ui.render')
+    } catch (error) {
+      $.ui.log(`usage-toolbar: 压缩后刷新用量失败 ${String(error)}`, { to: 'debug' })
+    }
+    return result
+  })
 
   // 会话开始：恢复增强记录、注册命令并初始化状态行。
   // 用量统计不在这里重置：热重载保留状态，应用重启后由 loadHistory 末尾的回填恢复。
