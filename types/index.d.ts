@@ -117,6 +117,8 @@ export type HistoryEntry = {
   totals: SessionTotals
   /** 最近 100 轮主会话记录。 */
   rounds: UsageRound[]
+  /** 该会话的代理计数，按 agentId 分组的请求/轮数/输出/生成耗时；旧快照没有该字段。 */
+  agentTotals?: Record<string, AgentTotals>
   /** 会话结束时的估算费用（USD）；宿主无账本时缺省。 */
   costUsd?: number
   /** 会话结束时的上下文占比。 */
@@ -132,6 +134,8 @@ declare module 'claude-code' {
       totals: Shaped<SessionTotals>
       agentTotals: Shaped<Record<string, AgentTotals>>
       view: Shaped<UsageView>
+      resetConfirming: Shaped<boolean>
+      clearConfirming: Shaped<boolean>
       enhanceRecords: Shaped<EnhanceRecord[]>
       enhanceState: Shaped<EnhanceState | null>
       ticker: Shaped<TickerState | null>

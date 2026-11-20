@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   ttft_count INTEGER NOT NULL DEFAULT 0,
   cost_usd REAL,
   context_percent REAL,
-  by_model TEXT NOT NULL DEFAULT '{}'
+  by_model TEXT NOT NULL DEFAULT '{}',
+  agent_totals TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS rounds (
@@ -63,6 +64,8 @@ def connect():
     columns = [row[1] for row in conn.execute("PRAGMA table_info(sessions)")]
     if "by_model" not in columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN by_model TEXT NOT NULL DEFAULT '{}'")
+    if "agent_totals" not in columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN agent_totals TEXT NOT NULL DEFAULT '{}'")
     return conn
 
 
@@ -99,8 +102,9 @@ def save(payload):
             INSERT INTO sessions (
               session_id, updated_at, input_tokens, output_tokens,
               cache_read_tokens, cache_creation_tokens, requests, turns,
-              gen_ms, ttft_total_ms, ttft_count, cost_usd, context_percent, by_model
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              gen_ms, ttft_total_ms, ttft_count, cost_usd, context_percent, by_model,
+              agent_totals
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(session_id) DO UPDATE SET
               updated_at=excluded.updated_at,
               input_tokens=excluded.input_tokens,
@@ -114,7 +118,8 @@ def save(payload):
               ttft_count=excluded.ttft_count,
               cost_usd=excluded.cost_usd,
               context_percent=excluded.context_percent,
-              by_model=excluded.by_model
+              by_model=excluded.by_model,
+              agent_totals=excluded.agent_totals
             """,
             (
                 session_id,
@@ -131,6 +136,7 @@ def save(payload):
                 as_float(payload.get("costUsd")),
                 as_float(payload.get("contextPercent")),
                 json.dumps(totals.get("byModel") or {}, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(payload.get("agentTotals") or {}, ensure_ascii=False, separators=(",", ":")),
             ),
         )
 
@@ -208,6 +214,10 @@ def load(limit=20):
             by_model = json.loads(session["by_model"] or "{}")
         except json.JSONDecodeError:
             by_model = {}
+        try:
+            agent_totals = json.loads(session["agent_totals"] or "{}")
+        except json.JSONDecodeError:
+            agent_totals = {}
 
         result.append(
             {
@@ -227,6 +237,7 @@ def load(limit=20):
                     "ttftCount": session["ttft_count"],
                     "byModel": by_model,
                 },
+                "agentTotals": agent_totals,
                 "rounds": [
                     {
                         "turnId": item["turn_id"],
@@ -249,9 +260,23 @@ def load(limit=20):
     return result
 
 
+def delete(session_id):
+    """删除一个会话的累计与轮次，用于面板的重置统计。"""
+    session_id = str(session_id or "")
+    if not session_id:
+        raise ValueError("missing sessionId")
+
+    conn = connect()
+    with conn:
+        conn.execute("DELETE FROM rounds WHERE session_id=?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+    conn.close()
+    return {"ok": True, "deleted": session_id}
+
+
 def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "usage: usage_store.py save|load [limit]"}, ensure_ascii=False))
+        print(json.dumps({"error": "usage: usage_store.py save|load|delete [id|limit]"}, ensure_ascii=False))
         return 2
 
     command = sys.argv[1]
@@ -263,6 +288,10 @@ def main():
         if command == "load":
             limit = as_int(sys.argv[2], 20) if len(sys.argv) > 2 else 20
             print(json.dumps(load(limit), ensure_ascii=False))
+            return 0
+        if command == "delete":
+            session_id = sys.argv[2] if len(sys.argv) > 2 else ""
+            print(json.dumps(delete(session_id), ensure_ascii=False))
             return 0
         print(json.dumps({"error": f"unknown command: {command}"}, ensure_ascii=False))
         return 2

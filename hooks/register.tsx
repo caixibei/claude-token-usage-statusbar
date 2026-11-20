@@ -49,6 +49,27 @@ const view = atom(
   'speed' as UsageView,
   { shape: 'view-1' },
 )
+/**
+ * 重置的两步确认是否停在第二步。
+ *
+ * <p>确认放在面板内部而不是 {@code $.ui.ask}：后者本质是一次工具调用，会被宿主画进
+ * 会话记录；面板内的确认只存在于渲染树里。写入本状态会让面板重绘到确认步骤。</p>
+ */
+const resetConfirming = atom(
+  { plugin: 'usage-toolbar', key: 'resetConfirming' } as const,
+  false,
+  { shape: 'reset-confirming-1' },
+)
+/**
+ * 清空当前会话增强记录的两步确认是否停在第二步。
+ *
+ * <p>与重置确认同一模式：确认只存在于面板渲染树里，不调用会写入会话的 AskUserQuestion。</p>
+ */
+const clearConfirming = atom(
+  { plugin: 'usage-toolbar', key: 'clearConfirming' } as const,
+  false,
+  { shape: 'clear-confirming-1' },
+)
 const enhanceRecords = atom(
   { plugin: 'usage-toolbar', key: 'enhanceRecords' } as const,
   [] as EnhanceRecord[],
@@ -594,15 +615,22 @@ async function loadHistory($: EngineInterface): Promise<void> {
  * <p>以 rounds 表为准而不是 sessions 行的累计：sessions 行每次保存都用当时的内存快照
  * 覆盖，被重置过的会话累计会失真；rounds 表按 turn_id 累积，保留完整轮次。</p>
  *
- * <p>只在内存没有任何轮次时回填，热重载保留了状态时不会重复计数。</p>
+ * <p>轮次与代理计数分开判断：各自为空时才从快照恢复，热重载保留了状态时不重复计数。
+ * 代理计数没有宿主侧的重建来源（工作流子代理不在 {@code $.agent.list()} 中），必须随
+ * 会话快照持久化。</p>
  */
 async function restoreSessionStats(
   $: EngineInterface,
   entries: HistoryEntry[] | null,
 ): Promise<void> {
   try {
-    const existing = await read($, rounds)
-    if (existing.length > 0) return
+    const [existingRounds, existingAgents] = await Promise.all([
+      read($, rounds),
+      read($, agentTotals),
+    ])
+    const needsRounds = existingRounds.length === 0
+    const needsAgents = Object.keys(existingAgents).length === 0
+    if (!needsRounds && !needsAgents) return
     if (!entries || entries.length === 0) return
 
     let sessionId: string
@@ -614,13 +642,24 @@ async function restoreSessionStats(
     }
 
     const entry = entries.find(item => item.sessionId === sessionId)
-    if (!entry || entry.rounds.length === 0) return
+    if (!entry) return
 
-    const restored = totalsFromRounds(entry.rounds)
-    await update($, rounds, () => entry.rounds.slice(-100))
-    await update($, totals, () => restored)
-    await refreshStatus($)
-    $.ui.log(`usage-toolbar: 已从数据库回填当前会话 ${entry.rounds.length} 轮`)
+    if (needsRounds && entry.rounds.length > 0) {
+      const restored = totalsFromRounds(entry.rounds)
+      await update($, rounds, () => entry.rounds.slice(-100))
+      await update($, totals, () => restored)
+      await refreshStatus($)
+      $.ui.log(`usage-toolbar: 已从数据库回填当前会话 ${entry.rounds.length} 轮`)
+    }
+
+    // 代理计数只存在快照里；重启后宿主名单无法重建工作流子代理与已回收的子代理。
+    if (needsAgents && entry.agentTotals && Object.keys(entry.agentTotals).length > 0) {
+      await update($, agentTotals, () => entry.agentTotals ?? {})
+      $.ui.log(
+        `usage-toolbar: 已回填当前会话 ${Object.keys(entry.agentTotals).length} 个代理的计数`,
+        { to: 'debug' },
+      )
+    }
   } catch (error) {
     $.ui.log(`usage-toolbar: 回填当前会话统计失败 ${String(error)}`)
   }
@@ -632,8 +671,9 @@ async function restoreSessionStats(
  * <p>rounds 表不保存每轮请求数，requests 无法精确还原，按轮数作为下限近似；
  * 这样保证「请求数 ≥ 轮数」，且模型明细的请求数之和与总数一致。</p>
  */
-function totalsFromRounds(list: UsageRound[]): SessionTotals {
-  const result: SessionTotals = {
+/** 空的会话累计；重置统计与状态恢复共用同一形状。 */
+function emptyTotals(): SessionTotals {
+  return {
     inputTokens: 0,
     outputTokens: 0,
     cacheReadTokens: 0,
@@ -645,6 +685,10 @@ function totalsFromRounds(list: UsageRound[]): SessionTotals {
     ttftCount: 0,
     byModel: {},
   }
+}
+
+function totalsFromRounds(list: UsageRound[]): SessionTotals {
+  const result = emptyTotals()
 
   for (const round of list) {
     const key = round.model || 'unknown'
@@ -697,6 +741,48 @@ async function ensureSessionRestored($: EngineInterface): Promise<void> {
 }
 
 /**
+ * 重置当前会话的统计：清空内存轮次与累计，并删除数据库中该会话的行。
+ *
+ * <p>内存与数据库必须一起清：saveHistory 每轮都把内存中的全部轮次写回数据库，
+ * 只清库时旧数据会在下一次轮次结束时重新出现。只影响当前会话，其他会话的
+ * 记录不动。</p>
+ */
+async function resetSessionStats($: EngineInterface): Promise<void> {
+  let sessionId: string
+  try {
+    sessionId = await $.session.id()
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 重置统计读取会话 id 失败 ${String(error)}`, { to: 'debug' })
+    $.ui.toast('重置失败：读取会话 id 出错')
+    return
+  }
+
+  await update($, rounds, () => [])
+  await update($, totals, () => emptyTotals())
+  await update($, agentTotals, () => ({}))
+  // 内存已清空，界面立即收起确认态；后续删除数据库失败只提示，不回滚已清空的内存统计。
+  await update($, resetConfirming, () => false)
+
+  // 旧版本的单会话快照只在 SQLite 不可用时作为回退，一并删除避免恢复出旧数据。
+  try {
+    await $.store.delete(HISTORY_STORE_KEY)
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 重置本地快照失败 ${String(error)}`, { to: 'debug' })
+  }
+
+  try {
+    await runUsageStore($, ['delete', sessionId])
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 删除数据库会话失败 ${String(error)}`, { to: 'debug' })
+    $.ui.toast('内存统计已重置，但删除数据库记录失败')
+  }
+
+  await refreshStatus($)
+  // 成功不往 transcript 写行：重置是用户主动发起的静默操作，面板数据清空即反馈。
+  $.ui.log(`usage-toolbar: 已重置会话 ${sessionId} 的统计`, { to: 'debug' })
+}
+
+/**
  * 把当前会话的轮次、累计、费用与上下文写入本地 SQLite。
  *
  * <p>写入按会话 ID 区分，不并入其他会话统计。SQLite 失败时写 $.store 单快照作为回退。</p>
@@ -706,7 +792,11 @@ async function saveHistory($: EngineInterface): Promise<void> {
 
   try {
     const sessionId = await $.session.id()
-    const [list, current] = await Promise.all([read($, rounds), read($, totals)])
+    const [list, current, agentMap] = await Promise.all([
+      read($, rounds),
+      read($, totals),
+      read($, agentTotals),
+    ])
     let costUsd: number | undefined
     let contextPercent: number | undefined
     try {
@@ -721,6 +811,7 @@ async function saveHistory($: EngineInterface): Promise<void> {
       sessionId,
       totals: current,
       rounds: list.slice(-100),
+      agentTotals: agentMap,
       costUsd,
       contextPercent,
       updatedAt: await $.clock.now(),
@@ -897,6 +988,30 @@ async function rememberEnhance(
 }
 
 /**
+ * 清空当前会话的增强记录：更新内存视图并写回持久层，其他会话的记录保留。
+ *
+ * <p>删除不可恢复，入口只允许经过面板内两步确认；调用前已确认会话 id 存在。
+ * 用函数式更新过滤内存，避免把清空瞬间新增的记录覆盖掉。</p>
+ */
+async function clearEnhanceRecords($: EngineInterface, sessionId: string): Promise<void> {
+  let remaining: EnhanceRecord[] = []
+  await update($, enhanceRecords, list => {
+    remaining = list.filter(record => record.sessionId !== sessionId)
+    return remaining
+  })
+  // 记录已清空，界面立即收起确认态。
+  await update($, clearConfirming, () => false)
+
+  try {
+    await $.store.set(ENHANCE_STORE_KEY, remaining)
+  } catch (error) {
+    // 内存已清空但持久层失败：提示用户，重启后记录可能恢复，不影响当前会话继续使用。
+    $.ui.log(`usage-toolbar: 保存清空后的增强记录失败 ${String(error)}`, { to: 'debug' })
+    $.ui.toast('清空失败：本地记录保存出错')
+  }
+}
+
+/**
  * 提交前增强的触发前缀：消息以其中之一开头时，先改写再发出。
  *
  * <p>不用 `!`：Claude Code 把行首 `!` 交给 shell，PowerShell 会把 `!!` 当一元运算符执行，
@@ -1034,7 +1149,12 @@ function registerUi(on: On): void {
             key="open-usage"
             label="▦ 用量"
             onPress={() => {
-              void openUsagePane($)
+              void (async () => {
+                // 从入口按钮打开时从头开始，不继承上一次遗留的危险确认。
+                await update($, resetConfirming, () => false)
+                await update($, clearConfirming, () => false)
+                await openUsagePane($)
+              })()
             }}
           />
         </Box>
@@ -1046,6 +1166,8 @@ function registerUi(on: On): void {
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const current = await read($, view)
+    const confirmingReset = await read($, resetConfirming)
+    const confirmingClear = await read($, clearConfirming)
     const list = await read($, rounds)
     const sum = await read($, totals)
     const maps = await read($, agentTotals)
@@ -1080,7 +1202,12 @@ function registerUi(on: On): void {
         label={label}
         variant={current === id ? 'primary' : 'secondary'}
         onPress={() => {
-          void update($, view, () => id)
+          void (async () => {
+            await update($, view, () => id)
+            // 切页签即视为取消两种危险确认，避免回到原页签时停留在确认步骤。
+            await update($, resetConfirming, () => false)
+            await update($, clearConfirming, () => false)
+          })()
         }}
       />
     )
@@ -1161,24 +1288,52 @@ function registerUi(on: On): void {
             <Box flexGrow={1} />
             <Button
               key="clear-records"
-              label="清空记录"
+              label="清空记录…"
               onPress={() => {
                 if (!currentSessionId) {
-                  $.ui.log('usage-toolbar: 未取得会话 id，跳过清空增强记录')
+                  $.ui.log('usage-toolbar: 未取得会话 id，跳过清空增强记录', { to: 'debug' })
                   return
                 }
-                void (async () => {
-                  // 只清当前会话的记录，其他会话的记录继续保留。
-                  let remaining: EnhanceRecord[] = []
-                  await update($, enhanceRecords, list => {
-                    remaining = list.filter(record => record.sessionId !== currentSessionId)
-                    return remaining
-                  })
-                  await $.store.set(ENHANCE_STORE_KEY, remaining)
-                })()
+                void update($, clearConfirming, () => true)
               }}
             />
           </Box>
+          {/* 与重置告警同一形态：红色边框 + 红色标题说明范围，确认放在面板内部，
+              不写入会话。 */}
+          <Box flexDirection="column" borderStyle="round" borderColor="error" paddingX={1}>
+            <Text weight="semibold" color="error">⚠ 危险操作 · 清空当前会话的增强记录</Text>
+            <Text>删除当前会话的全部增强记录，且无法恢复。</Text>
+            <Text dimColor>其他会话的记录不受影响。</Text>
+          </Box>
+          {confirmingClear && (
+            <Box flexDirection="column">
+              <Text weight="semibold">确认清空？此操作无法恢复。</Text>
+              <Box flexDirection="row" width={e.props.bodyColumns} gap={1}>
+                <Box flexGrow={1} />
+                <Button
+                  key="clear-cancel"
+                  onPress={() => {
+                    void update($, clearConfirming, () => false)
+                  }}
+                >
+                  {'取消'}
+                </Button>
+                <Button
+                  key="clear-confirm"
+                  onPress={() => {
+                    if (!currentSessionId) {
+                      $.ui.log('usage-toolbar: 清空确认时未取得会话 id，跳过', { to: 'debug' })
+                      void update($, clearConfirming, () => false)
+                      return
+                    }
+                    void clearEnhanceRecords($, currentSessionId)
+                  }}
+                >
+                  {'确认清空'}
+                </Button>
+              </Box>
+            </Box>
+          )}
           {records.length === 0 && (
             <Text dimColor>还没有增强记录。点击输入框上方的「✦ 增强」或执行 /enhance。</Text>
           )}
@@ -1228,6 +1383,8 @@ function registerUi(on: On): void {
             {metric('估算费用', cost === null ? '不可得' : `$${cost.toFixed(2)}`)}
             {metric('上下文', contextPercent === null ? '—' : `${contextPercent}%`)}
           </Box>
+          {/* 与上方指标卡拉开一行，避免两个区块黏在一起。 */}
+          <Text>{' '}</Text>
           <Text dimColor>模型明细</Text>
           <Box flexDirection="row" gap={1}>
             <Box width={modelWidth}><Text dimColor>模型</Text></Box>
@@ -1247,13 +1404,77 @@ function registerUi(on: On): void {
             </Box>
           ))}
           <Text dimColor>费用为宿主 /cost 的本地估算，不是账单。</Text>
+          <Text>{' '}</Text>
+          {/* 桌面端原生 Button 不呈现子 Text 的颜色（运行时截图确认），风险不能只靠颜色传达：
+              边框告警块常驻说明清空范围与不可恢复性；确认放在面板内部，不调用会写入会话的
+              AskUserQuestion 卡片。 */}
+          <Box flexDirection="column" borderStyle="round" borderColor="error" paddingX={1}>
+            <Text weight="semibold" color="error">⚠ 危险操作 · 重置当前会话统计</Text>
+            <Text>清空本会话的轮次与累计，并删除数据库中该会话的记录。</Text>
+            <Text dimColor>删除后无法恢复；其他会话的数据不受影响。</Text>
+          </Box>
+          <Text>{' '}</Text>
+          {confirmingReset ? (
+            <Box flexDirection="column">
+              <Text weight="semibold">确认重置？此操作无法恢复。</Text>
+              <Box flexDirection="row" width={e.props.bodyColumns} gap={1}>
+                <Box flexGrow={1} />
+                <Button
+                  key="reset-cancel"
+                  onPress={() => {
+                    void update($, resetConfirming, () => false)
+                  }}
+                >
+                  {'取消'}
+                </Button>
+                <Button
+                  key="reset-confirm"
+                  onPress={() => {
+                    void resetSessionStats($)
+                  }}
+                >
+                  {'确认重置'}
+                </Button>
+              </Box>
+            </Box>
+          ) : (
+            <Box flexDirection="row" width={e.props.bodyColumns}>
+              <Box flexGrow={1} />
+              <Button
+                key="reset-stats"
+                onPress={() => {
+                  void update($, resetConfirming, () => true)
+                }}
+              >
+                {'重置统计…'}
+              </Button>
+            </Box>
+          )}
         </Box>
       )
     }
 
     // 子代理视图：独立统计，明确标注不计入会话累计。
+    // 宿主名单（$.agent.list）不收录工作流子代理与引擎内部循环，但它们的 turn 事件带
+    // agentId，已被 agentTotals 按 id 计数；名单之外的条目单独聚合成一行，不把未知 id
+    // 伪装成有名称、模型的具体代理。
     const agentsView = () => {
-      if (agents.length === 0) {
+      const listedIds = new Set(agents.map(agent => agent.id))
+      const unlisted = Object.entries(maps).filter(([id]) => !listedIds.has(id))
+      const unlistedTotals = unlisted.reduce(
+        (acc, [, counted]) => ({
+          requests: acc.requests + counted.requests,
+          turns: acc.turns + counted.turns,
+          outputTokens: acc.outputTokens + counted.outputTokens,
+          genMs: acc.genMs + counted.genMs,
+        }),
+        { requests: 0, turns: 0, outputTokens: 0, genMs: 0 },
+      )
+      const unlistedTps =
+        unlistedTotals.genMs > 0 ? (unlistedTotals.outputTokens / unlistedTotals.genMs) * 1000 : null
+
+      // 名单与按 id 计数都为空，才是真的没有可展示的子代理。
+      if (agents.length === 0 && unlisted.length === 0) {
         return (
           <Box flexDirection="column">
             <Text dimColor>子代理 · 独立统计，不计入会话累计</Text>
@@ -1280,44 +1501,62 @@ function registerUi(on: On): void {
       return (
         <Box flexDirection="column">
           <Text dimColor>子代理 · 独立统计，不计入会话累计</Text>
-          <Box flexDirection="row" flexWrap="wrap" rowGap={1}>
-            {metric('总用量', fmtTokens(agentUsage.input + agentUsage.output))}
-            {metric('输入', fmtTokens(agentUsage.input))}
-            {metric('输出', fmtTokens(agentUsage.output))}
-            {metric('请求次数', String(requests))}
-            {metric('轮数', String(turns))}
-            {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`)}
-            {metric('估算费用', `$${agentUsage.cost.toFixed(2)}`)}
-          </Box>
-          <Text dimColor>任务列表</Text>
-          {agents.map(agent => {
-            const counted = maps[agent.id]
-            const speed = counted && counted.genMs > 0 ? (counted.outputTokens / counted.genMs) * 1000 : null
-            return (
-              <Box key={agent.id} flexDirection="column">
-                <Text weight="semibold">
-                  {clip(agent.description || agent.id, Math.max(12, e.props.bodyColumns - 30))}
-                </Text>
-                <Text dimColor>{agent.type} · {agent.status} · {agent.model ? modelLabel(agent.model) : '未知模型'}</Text>
-                <Text>
-                  Token {fmtTokens(agent.tokenCount)} · 请求 {counted?.requests ?? 0} · 速度{' '}
-                  {speed === null ? '—' : `${speed.toFixed(1)} t/s`}
-                </Text>
+          {agents.length > 0 && (
+            <Box flexDirection="column">
+              <Box flexDirection="row" flexWrap="wrap" rowGap={1}>
+                {metric('总用量', fmtTokens(agentUsage.input + agentUsage.output))}
+                {metric('输入', fmtTokens(agentUsage.input))}
+                {metric('输出', fmtTokens(agentUsage.output))}
+                {metric('请求次数', String(requests))}
+                {metric('轮数', String(turns))}
+                {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`)}
+                {metric('估算费用', `$${agentUsage.cost.toFixed(2)}`)}
               </Box>
-            )
-          })}
+              <Text dimColor>任务列表</Text>
+              {agents.map(agent => {
+                const counted = maps[agent.id]
+                const speed = counted && counted.genMs > 0 ? (counted.outputTokens / counted.genMs) * 1000 : null
+                return (
+                  <Box key={agent.id} flexDirection="column">
+                    <Text weight="semibold">
+                      {clip(agent.description || agent.id, Math.max(12, e.props.bodyColumns - 30))}
+                    </Text>
+                    <Text dimColor>{agent.type} · {agent.status} · {agent.model ? modelLabel(agent.model) : '未知模型'}</Text>
+                    <Text>
+                      Token {fmtTokens(agent.tokenCount)} · 请求 {counted?.requests ?? 0} · 速度{' '}
+                      {speed === null ? '—' : `${speed.toFixed(1)} t/s`}
+                    </Text>
+                  </Box>
+                )
+              })}
+            </Box>
+          )}
+          {unlisted.length > 0 && (
+            <Box flexDirection="column">
+              {agents.length > 0 && <Text>{' '}</Text>}
+              <Text dimColor>宿主未列出的代理循环（工作流子代理或引擎内部任务）</Text>
+              <Text>
+                请求 {unlistedTotals.requests} · 轮数 {unlistedTotals.turns} · 输出{' '}
+                {fmtTokens(unlistedTotals.outputTokens)} · 平均速度{' '}
+                {unlistedTps === null ? '—' : `${unlistedTps.toFixed(1)} t/s`}
+              </Text>
+              <Text dimColor>宿主不提供这些循环的名称、模型与费用，仅按 agentId 计数。</Text>
+            </Box>
+          )}
         </Box>
       )
     }
 
     return (
-      <Box flexDirection="column" rowGap={1}>
+      <Box flexDirection="column">
         <Box flexDirection="row" gap={1}>
           {tab('speed', '速度')}
           {tab('enhance', '增强')}
           {tab('session', '会话')}
           {tab('agents', '代理')}
         </Box>
+        {/* Pane 按行绘制，空 Box 不产生行；用一行空白 Text 撑开标签与内容的间距。 */}
+        <Text>{' '}</Text>
         {current === 'speed' && speedView()}
         {current === 'enhance' && enhanceView()}
         {current === 'session' && sessionView()}
@@ -1342,6 +1581,7 @@ export const register: Register = on => {
     void startHistoryLoad($)
     await $.command.register({ name: 'usagebar', description: '打开用量面板' })
     await $.command.register({ name: 'enhance', description: '增强当前输入框草稿' })
+    await $.command.register({ name: 'resetusage', description: '重置当前会话统计' })
     await refreshStatus($)
 
     // 语录轮播：每秒推进动画帧，每 5 秒换一句；只有主循环生成时才写入。
@@ -1363,6 +1603,9 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'usagebar' }, async $ => {
+    // 普通打开从头开始，不继承上一次遗留的危险确认。
+    await update($, resetConfirming, () => false)
+    await update($, clearConfirming, () => false)
     const opened = await openUsagePane($)
     if (opened.isPlaced) return { text: '用量面板已打开' }
 
@@ -1373,5 +1616,22 @@ export const register: Register = on => {
     await runEnhance($)
 
     return { text: '提示词增强已结束' }
+  })
+
+  on('command.run', { command: 'resetusage' }, async $ => {
+    // 不直接重置，也不在会话里弹确认卡：打开面板并停在第二步确认。
+    // 不返回 text：成功或取消都不在对话里留行。
+    const opened = await openUsagePane($)
+    if (!opened.isPlaced) {
+      $.ui.log('usage-toolbar: 重置未执行：用量面板无法打开', { to: 'debug' })
+      $.ui.toast('重置未执行：用量面板无法打开')
+      return {}
+    }
+
+    await update($, view, () => 'session')
+    await update($, clearConfirming, () => false)
+    await update($, resetConfirming, () => true)
+
+    return {}
   })
 }
