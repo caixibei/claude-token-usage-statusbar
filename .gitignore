@@ -1,0 +1,6 @@
+# 宿主加载 mod 时生成的类型目录
+.claude-plugin/types/
+
+# 依赖与日志
+node_modules/
+*.log

@@ -1,0 +1,12 @@
+{
+  "name": "usage-toolbar-local",
+  "owner": { "name": "caixi" },
+  "description": "Local marketplace for the usage-toolbar Claude Desktop mod",
+  "plugins": [
+    {
+      "name": "usage-toolbar",
+      "source": "./",
+      "description": "TPS, session usage, subagent usage and prompt enhancement toolbar for Claude Desktop"
+    }
+  ]
+}

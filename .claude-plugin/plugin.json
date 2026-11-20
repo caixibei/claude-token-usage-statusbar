@@ -1,0 +1,8 @@
+{
+  "name": "usage-toolbar",
+  "version": "0.1.0",
+  "description": "TPS, session usage, subagent usage and prompt enhancement toolbar for Claude Desktop",
+  "author": { "name": "caixi" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
