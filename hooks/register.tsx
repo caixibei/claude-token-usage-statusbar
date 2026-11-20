@@ -64,16 +64,6 @@ const ticker = atom(
   null as TickerState | null,
   { shape: 'ticker-1' },
 )
-const history = atom(
-  { plugin: 'usage-toolbar', key: 'history' } as const,
-  [] as HistoryEntry[],
-  { shape: 'history-2' },
-)
-const historyView = atom(
-  { plugin: 'usage-toolbar', key: 'historyView' } as const,
-  null as string | null,
-  { shape: 'history-view-1' },
-)
 
 /** 增强记录跨会话存储键；最多保留 200 条。 */
 const ENHANCE_STORE_KEY = 'enhance-records'
@@ -566,28 +556,143 @@ async function runUsageStore(
   throw new Error(lastError || 'python not found')
 }
 
-/** 从本地 SQLite 恢复最近 20 个会话；失败时回退到 $.store 单快照。 */
+/**
+ * 读取本地存储中的会话记录，只用于回填当前会话的统计。
+ *
+ * <p>其他会话的数据仅在内存中短暂参与匹配，不会被写入状态或展示。</p>
+ */
 async function loadHistory($: EngineInterface): Promise<void> {
   try {
     const result = await runUsageStore($, ['load', '20'])
     const entries = JSON.parse(result.stdout.trim()) as HistoryEntry[]
     if (Array.isArray(entries)) {
-      await update($, history, () => entries)
+      await restoreSessionStats($, entries)
       return
     }
   } catch (error) {
     $.ui.log(`usage-toolbar: 读取 SQLite 历史失败 ${String(error)}`)
   }
 
-  // 旧版本只写过 $.store 单快照；SQLite 不可用时仍尽力展示它。
+  // 旧版本只写过 $.store 单快照；SQLite 不可用时仍尽力用它回填。
   try {
     const stored = await $.store.get(HISTORY_STORE_KEY)
     const candidate = stored as HistoryEntry | null
     if (candidate && Array.isArray(candidate.rounds) && candidate.sessionId) {
-      await update($, history, () => [candidate])
+      await restoreSessionStats($, [candidate])
     }
   } catch (error) {
     $.ui.log(`usage-toolbar: 读取本地历史回退失败 ${String(error)}`)
+  }
+}
+
+/**
+ * 从 SQLite 历史回填当前会话的内存统计。
+ *
+ * <p>数据来源：loadHistory 已读到的会话条目。宿主 {@code $.state} 只保证热重载后保留，
+ * 应用重启或插件重装后会被重建，而面板直接读内存状态，重置后已有轮次会显示为空。</p>
+ *
+ * <p>以 rounds 表为准而不是 sessions 行的累计：sessions 行每次保存都用当时的内存快照
+ * 覆盖，被重置过的会话累计会失真；rounds 表按 turn_id 累积，保留完整轮次。</p>
+ *
+ * <p>只在内存没有任何轮次时回填，热重载保留了状态时不会重复计数。</p>
+ */
+async function restoreSessionStats(
+  $: EngineInterface,
+  entries: HistoryEntry[] | null,
+): Promise<void> {
+  try {
+    const existing = await read($, rounds)
+    if (existing.length > 0) return
+    if (!entries || entries.length === 0) return
+
+    let sessionId: string
+    try {
+      sessionId = await $.session.id()
+    } catch (error) {
+      $.ui.log(`usage-toolbar: 回填时读取会话 id 失败 ${String(error)}`)
+      return
+    }
+
+    const entry = entries.find(item => item.sessionId === sessionId)
+    if (!entry || entry.rounds.length === 0) return
+
+    const restored = totalsFromRounds(entry.rounds)
+    await update($, rounds, () => entry.rounds.slice(-100))
+    await update($, totals, () => restored)
+    await refreshStatus($)
+    $.ui.log(`usage-toolbar: 已从数据库回填当前会话 ${entry.rounds.length} 轮`)
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 回填当前会话统计失败 ${String(error)}`)
+  }
+}
+
+/**
+ * 从轮次记录聚合会话累计。
+ *
+ * <p>rounds 表不保存每轮请求数，requests 无法精确还原，按轮数作为下限近似；
+ * 这样保证「请求数 ≥ 轮数」，且模型明细的请求数之和与总数一致。</p>
+ */
+function totalsFromRounds(list: UsageRound[]): SessionTotals {
+  const result: SessionTotals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    requests: 0,
+    turns: 0,
+    genMs: 0,
+    ttftTotalMs: 0,
+    ttftCount: 0,
+    byModel: {},
+  }
+
+  for (const round of list) {
+    const key = round.model || 'unknown'
+    const prev = result.byModel[key] ?? { inputTokens: 0, outputTokens: 0, requests: 0, genMs: 0 }
+    result.inputTokens += round.inputTokens
+    result.outputTokens += round.outputTokens
+    result.cacheReadTokens += round.cacheReadTokens
+    result.cacheCreationTokens += round.cacheCreationTokens
+    result.requests += 1
+    result.turns += 1
+    result.genMs += round.genMs
+    result.ttftTotalMs += round.ttftMs ?? 0
+    result.ttftCount += round.ttftMs === null ? 0 : 1
+    result.byModel[key] = {
+      inputTokens: prev.inputTokens + round.inputTokens,
+      outputTokens: prev.outputTokens + round.outputTokens,
+      requests: prev.requests + 1,
+      genMs: prev.genMs + round.genMs,
+    }
+  }
+
+  return result
+}
+
+/** 启动（或加入）历史加载；加载完成后当前会话的回填一起就绪。 */
+function startHistoryLoad($: EngineInterface): Promise<void> {
+  if (!historyTask) {
+    historyTask = loadHistory($).finally(() => {
+      historyTask = null
+    })
+  }
+  return historyTask
+}
+
+/**
+ * 确保当前会话的内存统计可用：内存为空时从 SQLite 回填。
+ *
+ * <p>面板与状态行都读内存状态，而宿主在应用重启或插件重装后会重建
+ * {@code $.state}；打开面板前做一次惰性恢复，避免用户先看到空数据。</p>
+ */
+async function ensureSessionRestored($: EngineInterface): Promise<void> {
+  try {
+    if ((await read($, rounds)).length > 0) return
+    // 重新读库而不是复用会话启动时的快照：会话期间每次轮次结束都会写库，
+    // 启动时读到的历史条目可能缺少最近的轮次。
+    await startHistoryLoad($)
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 惰性恢复会话统计失败 ${String(error)}`)
   }
 }
 
@@ -637,6 +742,8 @@ async function saveHistory($: EngineInterface): Promise<void> {
 /** 串行化后台保存，避免同一会话的并发 SQLite 写入互相覆盖。 */
 let historySaving = false
 let historyPending = false
+/** 进行中的历史加载任务；并发调用复用同一个 Promise，避免重复读库。 */
+let historyTask: Promise<void> | null = null
 
 function queueHistorySave($: EngineInterface): void {
   if (historySaving) {
@@ -758,14 +865,28 @@ async function runEnhance($: EngineInterface): Promise<void> {
 }
 
 /**
- * 保存一条增强记录：先写会话状态，再写跨会话存储。
+ * 保存一条增强记录：补齐当前会话 id 后先写会话状态，再写本地存储。
+ *
+ * <p>记录按会话 id 归属，面板只展示当前会话的记录。会话 id 读取失败时
+ * 记录仍保存，但没有归属，不会出现在任何会话的列表中。</p>
  *
  * <p>存储失败只记日志，不影响已写入的会话状态与写回结果。</p>
  */
-async function rememberEnhance($: EngineInterface, record: EnhanceRecord): Promise<void> {
+async function rememberEnhance(
+  $: EngineInterface,
+  record: Omit<EnhanceRecord, 'sessionId'>,
+): Promise<void> {
+  let sessionId: string | undefined
+  try {
+    sessionId = await $.session.id()
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 增强记录读取会话 id 失败 ${String(error)}`)
+  }
+
+  const entry: EnhanceRecord = sessionId ? { ...record, sessionId } : record
   let saved: EnhanceRecord[] = []
   await update($, enhanceRecords, list => {
-    saved = [record, ...list].slice(0, RECORD_LIMIT)
+    saved = [entry, ...list].slice(0, RECORD_LIMIT)
     return saved
   })
   try {
@@ -848,7 +969,9 @@ async function enhanceForSubmit($: EngineInterface, original: string): Promise<s
  * <p>用 focus + closeOnEscape + holdToasts 请求对话框形态：宿主把面板升起并交给键盘焦点，
  * Esc 交还焦点并关闭；打开期间 toast 栈由面板代持。面板尺寸按宿主上限裁剪。</p>
  */
-function openUsagePane($: EngineInterface) {
+async function openUsagePane($: EngineInterface) {
+  // 打开前确保当前会话统计已从数据库回填，避免面板先渲染空数据。
+  await ensureSessionRestored($)
   return $.ui.open({
     id: PANE_ID,
     title: '用量',
@@ -926,9 +1049,7 @@ function registerUi(on: On): void {
     const list = await read($, rounds)
     const sum = await read($, totals)
     const maps = await read($, agentTotals)
-    const records = await read($, enhanceRecords)
-    const historyEntries = await read($, history)
-    const selectedHistoryId = await read($, historyView)
+    const allRecords = await read($, enhanceRecords)
 
     let usage: SessionUsage | null = null
     try {
@@ -944,22 +1065,13 @@ function registerUi(on: On): void {
       $.ui.log(`usage-toolbar: 面板读取子代理失败 ${String(error)}`)
     }
 
-    // 只展示用户主动选中的历史会话；默认始终展示当前会话，当前会话没有数据时显示空状态，
-    // 避免新会话一打开就看到其他会话的用量。
-    const historyEntry = selectedHistoryId
-      ? historyEntries.find(entry => entry.sessionId === selectedHistoryId) ?? null
-      : null
-
-    // 历史列表排除当前会话：当前会话已由默认视图展示，列表只保留其他会话。
+    // 面板所有视图都只展示当前会话的数据：会话 id 用于过滤增强记录。
     let currentSessionId: string | null = null
     try {
       currentSessionId = await $.session.id()
     } catch (error) {
       $.ui.log(`usage-toolbar: 读取当前会话 id 失败 ${String(error)}`)
     }
-    const otherHistoryEntries = currentSessionId
-      ? historyEntries.filter(entry => entry.sessionId !== currentSessionId)
-      : historyEntries
 
     // 视图切换：宿主没有原生 Tab，用一排 Button 写入 view 状态。
     const tab = (id: UsageView, label: string) => (
@@ -984,8 +1096,7 @@ function registerUi(on: On): void {
 
     // 生成速度视图：最近轮次平均、峰值/最低/最新与字符柱状图；按速度档位着色。
     const speedView = () => {
-      const sourceRounds = historyEntry ? historyEntry.rounds : list
-      const recent = sourceRounds.slice(-18)
+      const recent = list.slice(-18)
       const totalOut = recent.reduce((n, r) => n + r.outputTokens, 0)
       const totalGen = recent.reduce((n, r) => n + r.genMs, 0)
       const avg = totalGen > 0 ? (totalOut / totalGen) * 1000 : null
@@ -999,7 +1110,7 @@ function registerUi(on: On): void {
         ? clip(modelLabel(latestRound.model), Math.max(10, e.props.bodyColumns - 30))
         : '—'
       const maxTps = peak ?? 1
-      const scope = historyEntry ? `历史会话 ${formatTime(historyEntry.updatedAt)}` : '当前会话'
+      const scope = '当前会话'
 
       return (
         <Box flexDirection="column" rowGap={1}>
@@ -1030,82 +1141,75 @@ function registerUi(on: On): void {
               </Box>
             )
           })}
-          {otherHistoryEntries.length > 0 && (
-            <Box flexDirection="column" rowGap={1}>
-              <Text dimColor>历史会话</Text>
-              {otherHistoryEntries.slice(0, 5).map(entry => (
-                <Button
-                  key={entry.sessionId}
-                  label={`${formatTime(entry.updatedAt)} · ${fmtTokens(entry.totals.outputTokens)}`}
-                  variant={selectedHistoryId === entry.sessionId ? 'primary' : 'secondary'}
-                  onPress={() => {
-                    void update($, historyView, () => entry.sessionId)
-                  }}
-                />
-              ))}
-              {selectedHistoryId !== null && (
-                <Button
-                  key="current-session"
-                  label="回到当前会话"
-                  onPress={() => {
-                    void update($, historyView, () => null)
-                  }}
-                />
-              )}
-            </Box>
-          )}
         </Box>
       )
     }
 
-    // 增强记录视图：卡片列出原文、增强文、token 与耗时，并可清空。
-    const enhanceView = () => (
-      <Box flexDirection="column" rowGap={1}>
-        <Box flexDirection="row">
-          <Text dimColor>最近增强记录 {records.length} 条</Text>
-          <Button
-            key="clear-records"
-            label="清空记录"
-            onPress={() => {
-              void (async () => {
-                await update($, enhanceRecords, () => [])
-                await $.store.delete(ENHANCE_STORE_KEY)
-              })()
-            }}
-          />
-        </Box>
-        {records.length === 0 && (
-          <Text dimColor>还没有增强记录。点击输入框上方的「✦ 增强」或执行 /enhance。</Text>
-        )}
-        {records.slice(0, 8).map(record => (
-          <Box key={record.id} flexDirection="column" borderStyle="round" paddingX={1}>
-            <Text dimColor>模型 {modelLabel(record.model)}</Text>
-            <Text>原文：{clip(record.original, Math.max(20, e.props.bodyColumns - 16))}</Text>
-            <Text>增强：{clip(record.enhanced, Math.max(20, e.props.bodyColumns - 16))}</Text>
-            <Text dimColor>
-              消耗 {record.inputTokens}/{record.outputTokens} token · {formatTime(record.at)} ·{' '}
-              {Math.round(record.durationMs)}ms
-            </Text>
-          </Box>
-        ))}
-      </Box>
-    )
+    // 增强记录视图：只展示当前会话的记录，卡片列出原文、增强文、token 与耗时。
+    const enhanceView = () => {
+      // 旧版本记录没有 sessionId，不属于任何会话；读不到会话 id 时同样不展示。
+      const records = currentSessionId
+        ? allRecords.filter(record => record.sessionId === currentSessionId)
+        : []
 
-    // 会话累计视图：当前会话与选中的历史会话共用同一套卡片，费用取宿主 /cost 的本地估算。
+      return (
+        <Box flexDirection="column" rowGap={1}>
+          {/* 行宽显式取面板可用列数，再用弹性占位把按钮推到最右：Pane 内的 Box 宽度随内容收缩，
+              只写 justifyContent 时没有剩余空间可分布。 */}
+          <Box flexDirection="row" width={e.props.bodyColumns}>
+            <Text dimColor>最近增强记录 {records.length} 条</Text>
+            <Box flexGrow={1} />
+            <Button
+              key="clear-records"
+              label="清空记录"
+              onPress={() => {
+                if (!currentSessionId) {
+                  $.ui.log('usage-toolbar: 未取得会话 id，跳过清空增强记录')
+                  return
+                }
+                void (async () => {
+                  // 只清当前会话的记录，其他会话的记录继续保留。
+                  let remaining: EnhanceRecord[] = []
+                  await update($, enhanceRecords, list => {
+                    remaining = list.filter(record => record.sessionId !== currentSessionId)
+                    return remaining
+                  })
+                  await $.store.set(ENHANCE_STORE_KEY, remaining)
+                })()
+              }}
+            />
+          </Box>
+          {records.length === 0 && (
+            <Text dimColor>还没有增强记录。点击输入框上方的「✦ 增强」或执行 /enhance。</Text>
+          )}
+          {records.slice(0, 8).map(record => (
+            <Box key={record.id} flexDirection="column" borderStyle="round" paddingX={1}>
+              <Text dimColor>模型 {modelLabel(record.model)}</Text>
+              <Text>原文：{clip(record.original, Math.max(20, e.props.bodyColumns - 16))}</Text>
+              <Text>增强：{clip(record.enhanced, Math.max(20, e.props.bodyColumns - 16))}</Text>
+              <Text dimColor>
+                消耗 {record.inputTokens}/{record.outputTokens} token · {formatTime(record.at)} ·{' '}
+                {Math.round(record.durationMs)}ms
+              </Text>
+            </Box>
+          ))}
+        </Box>
+      )
+    }
+
+    // 会话累计视图：只展示当前会话，费用取宿主 /cost 的本地估算。
     const sessionView = () => {
-      const display = historyEntry ? historyEntry.totals : sum
+      const display = sum
       const total = display.inputTokens + display.outputTokens
       const avgDuration = display.turns > 0 ? display.genMs / display.turns : 0
       const avgTtft = display.ttftCount > 0 ? display.ttftTotalMs / display.ttftCount : 0
       const avgTps = display.genMs > 0 ? (display.outputTokens / display.genMs) * 1000 : null
-      const cost = historyEntry ? (historyEntry.costUsd ?? null) : (usage?.cost?.usd ?? null)
-      const contextPercent = historyEntry
-        ? (historyEntry.contextPercent ?? null)
-        : (usage?.context.percent ?? null)
+      const cost = usage?.cost?.usd ?? null
+      const contextPercent = usage?.context.percent ?? null
       const tokenWidth = 8
       const requestWidth = 6
       const modelWidth = Math.max(12, e.props.bodyColumns - tokenWidth - requestWidth - 4)
-      const scope = historyEntry ? `历史会话 ${formatTime(historyEntry.updatedAt)}` : '当前会话累计'
+      const scope = '当前会话累计'
 
       return (
         <Box flexDirection="column">
@@ -1143,30 +1247,6 @@ function registerUi(on: On): void {
             </Box>
           ))}
           <Text dimColor>费用为宿主 /cost 的本地估算，不是账单。</Text>
-          {otherHistoryEntries.length > 0 && (
-            <Box flexDirection="column" rowGap={1}>
-              <Text dimColor>历史会话</Text>
-              {otherHistoryEntries.slice(0, 5).map(entry => (
-                <Button
-                  key={entry.sessionId}
-                  label={`${formatTime(entry.updatedAt)} · ${fmtTokens(entry.totals.outputTokens)}`}
-                  variant={selectedHistoryId === entry.sessionId ? 'primary' : 'secondary'}
-                  onPress={() => {
-                    void update($, historyView, () => entry.sessionId)
-                  }}
-                />
-              ))}
-              {selectedHistoryId !== null && (
-                <Button
-                  key="current-session"
-                  label="回到当前会话"
-                  onPress={() => {
-                    void update($, historyView, () => null)
-                  }}
-                />
-              )}
-            </Box>
-          )}
         </Box>
       )
     }
@@ -1256,10 +1336,10 @@ export const register: Register = on => {
   registerUi(on)
 
   // 会话开始：恢复增强记录、注册命令并初始化状态行。
-  // state 在热重载后保留，因此这里不重置用量统计。
+  // 用量统计不在这里重置：热重载保留状态，应用重启后由 loadHistory 末尾的回填恢复。
   on('session.start', async ($, e, next) => {
     await loadRecords($)
-    void loadHistory($)
+    void startHistoryLoad($)
     await $.command.register({ name: 'usagebar', description: '打开用量面板' })
     await $.command.register({ name: 'enhance', description: '增强当前输入框草稿' })
     await refreshStatus($)

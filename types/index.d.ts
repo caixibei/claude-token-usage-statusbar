@@ -69,6 +69,8 @@ export type AgentTotals = {
 export type EnhanceRecord = {
   /** 记录 id，时间戳加序号，用于列表 key。 */
   id: string
+  /** 产生该记录的会话 id；旧版本记录没有该字段，不属于任何会话，不参与展示。 */
+  sessionId?: string
   /** 实际执行改写的模型 id。 */
   model: string
   /** 用户原始草稿。 */
@@ -133,8 +135,6 @@ declare module 'claude-code' {
       enhanceRecords: Shaped<EnhanceRecord[]>
       enhanceState: Shaped<EnhanceState | null>
       ticker: Shaped<TickerState | null>
-      history: Shaped<HistoryEntry[]>
-      historyView: Shaped<string | null>
     }
   }
 }
