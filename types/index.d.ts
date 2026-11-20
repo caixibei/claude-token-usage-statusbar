@@ -32,10 +32,15 @@ export type UsageRound = {
 
 /** 单个模型的会话累计用量。 */
 export type ModelTotals = {
+  /** 该模型各请求的未缓存输入 token 之和。 */
   inputTokens: number
   outputTokens: number
   requests: number
   genMs: number
+  /** 该模型从提示缓存读取的输入 token 之和；热重载保留的旧形状可能缺少该字段，按 0 处理。 */
+  cacheReadTokens: number
+  /** 该模型写入提示缓存的输入 token 之和；热重载保留的旧形状可能缺少该字段，按 0 处理。 */
+  cacheCreationTokens: number
 }
 
 /** 主会话累计用量，只统计主循环，不含子代理。 */

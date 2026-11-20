@@ -158,6 +158,30 @@ function tpsOfRound(round: UsageRound): number {
   return round.genMs > 0 ? (round.outputTokens / round.genMs) * 1000 : 0
 }
 
+/** 缓存率：缓存读取 ÷ 输入侧总量；输入侧为 0 时返回 null（无读数）。 */
+function cacheRateOf(
+  inputTokens: number,
+  cacheReadTokens: number,
+  cacheCreationTokens: number,
+): number | null {
+  const inputSide = inputTokens + cacheReadTokens + cacheCreationTokens
+  return inputSide > 0 ? (cacheReadTokens / inputSide) * 100 : null
+}
+
+/**
+ * 缓存率分档颜色：<80% 红色告警，80–90% 黄色告警，90–95% 绿色，≥95% 青色。
+ *
+ * <p>区间左闭右开，红色档与黄色档不重叠，红色告警的优先级由区间保证；
+ * 无读数（null）不着色，保持默认文本色。</p>
+ */
+function cacheRateLevel(rate: number | null): string | undefined {
+  if (rate === null) return undefined
+  if (rate < 80) return 'error'
+  if (rate < 90) return 'warning'
+  if (rate < 95) return '#3AAC85'
+  return '#2C8F87'
+}
+
 /**
  * 状态行文本：速度、本轮 token、会话 token 与上下文占比。
  *
@@ -271,14 +295,28 @@ function emptyAgent(): AgentTotals {
 /** 主循环请求计数：requests 加一，并按模型累计请求数。 */
 function addRequest(byModel: SessionTotals['byModel'], model: string): SessionTotals['byModel'] {
   const key = model || 'unknown'
-  const prev = byModel[key] ?? { inputTokens: 0, outputTokens: 0, requests: 0, genMs: 0 }
+  const prev = byModel[key] ?? {
+    inputTokens: 0,
+    outputTokens: 0,
+    requests: 0,
+    genMs: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+  }
   return { ...byModel, [key]: { ...prev, requests: prev.requests + 1 } }
 }
 
 /** 主循环轮次汇总：把一轮的真实用量并入会话累计与模型明细。 */
 function addRoundTotals(current: SessionTotals, round: UsageRound): SessionTotals {
   const key = round.model || 'unknown'
-  const prev = current.byModel[key] ?? { inputTokens: 0, outputTokens: 0, requests: 0, genMs: 0 }
+  const prev = current.byModel[key] ?? {
+    inputTokens: 0,
+    outputTokens: 0,
+    requests: 0,
+    genMs: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+  }
   return {
     ...current,
     inputTokens: current.inputTokens + round.inputTokens,
@@ -296,6 +334,9 @@ function addRoundTotals(current: SessionTotals, round: UsageRound): SessionTotal
         outputTokens: prev.outputTokens + round.outputTokens,
         requests: prev.requests,
         genMs: prev.genMs + round.genMs,
+        // 热重载保留的旧形状没有按模型的缓存字段，按 0 起算。
+        cacheReadTokens: (prev.cacheReadTokens ?? 0) + round.cacheReadTokens,
+        cacheCreationTokens: (prev.cacheCreationTokens ?? 0) + round.cacheCreationTokens,
       },
     },
   }
@@ -713,7 +754,14 @@ function totalsFromRounds(list: UsageRound[]): SessionTotals {
 
   for (const round of list) {
     const key = round.model || 'unknown'
-    const prev = result.byModel[key] ?? { inputTokens: 0, outputTokens: 0, requests: 0, genMs: 0 }
+    const prev = result.byModel[key] ?? {
+      inputTokens: 0,
+      outputTokens: 0,
+      requests: 0,
+      genMs: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    }
     result.inputTokens += round.inputTokens
     result.outputTokens += round.outputTokens
     result.cacheReadTokens += round.cacheReadTokens
@@ -728,6 +776,8 @@ function totalsFromRounds(list: UsageRound[]): SessionTotals {
       outputTokens: prev.outputTokens + round.outputTokens,
       requests: prev.requests + 1,
       genMs: prev.genMs + round.genMs,
+      cacheReadTokens: prev.cacheReadTokens + round.cacheReadTokens,
+      cacheCreationTokens: prev.cacheCreationTokens + round.cacheCreationTokens,
     }
   }
 
@@ -1380,11 +1430,15 @@ function registerUi(on: On): void {
       const avgDuration = display.turns > 0 ? display.genMs / display.turns : 0
       const avgTtft = display.ttftCount > 0 ? display.ttftTotalMs / display.ttftCount : 0
       const avgTps = display.genMs > 0 ? (display.outputTokens / display.genMs) * 1000 : null
+      // 缓存率：缓存读取 ÷ 输入侧总量；尚未产生输入时无读数，显示「—」。
+      const cacheRate = cacheRateOf(display.inputTokens, display.cacheReadTokens, display.cacheCreationTokens)
       const cost = usage?.cost?.usd ?? null
       const contextPercent = usage?.context.percent ?? null
+      // 模型明细列宽：30 列窄侧栏下模型名保留 9 列，Token/请求/缓存率共用其余宽度。
       const tokenWidth = 8
-      const requestWidth = 6
-      const modelWidth = Math.max(12, e.props.bodyColumns - tokenWidth - requestWidth - 4)
+      const requestWidth = 4
+      const cacheWidth = 6
+      const modelWidth = Math.max(9, e.props.bodyColumns - tokenWidth - requestWidth - cacheWidth - 4)
       const scope = '当前会话累计'
 
       return (
@@ -1396,6 +1450,7 @@ function registerUi(on: On): void {
             {metric('输出', fmtTokens(display.outputTokens))}
             {metric('缓存读取', fmtTokens(display.cacheReadTokens))}
             {metric('缓存写入', fmtTokens(display.cacheCreationTokens))}
+            {metric('缓存率', cacheRate === null ? '—' : `${cacheRate.toFixed(1)}%`, cacheRateLevel(cacheRate))}
             {metric('请求次数', String(display.requests))}
             {metric('轮数', String(display.turns))}
             {metric('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—')}
@@ -1411,19 +1466,33 @@ function registerUi(on: On): void {
             <Box width={modelWidth}><Text dimColor>模型</Text></Box>
             <Box width={tokenWidth} justifyContent="center"><Text dimColor>Token</Text></Box>
             <Box width={requestWidth} justifyContent="center"><Text dimColor>请求</Text></Box>
+            <Box width={cacheWidth} justifyContent="center"><Text dimColor>缓存率</Text></Box>
           </Box>
           {Object.entries(display.byModel).length === 0 && <Text dimColor>还没有模型用量</Text>}
-          {Object.entries(display.byModel).map(([model, modelTotals]) => (
-            <Box key={model} flexDirection="row" gap={1}>
-              <Box width={modelWidth}><Text>{clip(modelLabel(model), modelWidth)}</Text></Box>
-              <Box width={tokenWidth} justifyContent="center">
-                <Text>{fmtTokens(modelTotals.outputTokens)}</Text>
+          {Object.entries(display.byModel).map(([model, modelTotals]) => {
+            // 旧快照可能没有按模型的缓存字段，按 0 处理；无输入侧时显示「—」。
+            const rate = cacheRateOf(
+              modelTotals.inputTokens,
+              modelTotals.cacheReadTokens ?? 0,
+              modelTotals.cacheCreationTokens ?? 0,
+            )
+            return (
+              <Box key={model} flexDirection="row" gap={1}>
+                <Box width={modelWidth}><Text>{clip(modelLabel(model), modelWidth)}</Text></Box>
+                <Box width={tokenWidth} justifyContent="center">
+                  <Text>{fmtTokens(modelTotals.outputTokens)}</Text>
+                </Box>
+                <Box width={requestWidth} justifyContent="center">
+                  <Text>{String(modelTotals.requests)}</Text>
+                </Box>
+                <Box width={cacheWidth} justifyContent="center">
+                  <Text color={cacheRateLevel(rate)}>
+                    {rate === null ? '—' : `${rate.toFixed(1)}%`}
+                  </Text>
+                </Box>
               </Box>
-              <Box width={requestWidth} justifyContent="center">
-                <Text>{String(modelTotals.requests)}</Text>
-              </Box>
-            </Box>
-          ))}
+            )
+          })}
           <Text dimColor>费用为宿主 /cost 的本地估算，不是账单。</Text>
           <Text>{' '}</Text>
           {/* 桌面端原生 Button 不呈现子 Text 的颜色（运行时截图确认），风险不能只靠颜色传达：
