@@ -5,6 +5,7 @@ import type {
   AgentTotals,
   EnhanceRecord,
   EnhanceState,
+  HistoryEntry,
   SessionTotals,
   TickerState,
   UsageRound,
@@ -63,11 +64,31 @@ const ticker = atom(
   null as TickerState | null,
   { shape: 'ticker-1' },
 )
+const history = atom(
+  { plugin: 'usage-toolbar', key: 'history' } as const,
+  [] as HistoryEntry[],
+  { shape: 'history-2' },
+)
+const historyView = atom(
+  { plugin: 'usage-toolbar', key: 'historyView' } as const,
+  null as string | null,
+  { shape: 'history-view-1' },
+)
 
 /** 增强记录跨会话存储键；最多保留 200 条。 */
 const ENHANCE_STORE_KEY = 'enhance-records'
+/** 用量历史跨会话存储键，保存最近 100 轮与累计快照。 */
+const HISTORY_STORE_KEY = 'usage-history'
 const RECORD_LIMIT = 200
 const TEXT_LIMIT = 4000
+/**
+ * 实时速率的刷新间隔（毫秒）。
+ *
+ * <p>按时间节流而不是按 chunk 数量：第三方网关可能按大块返回流式内容，chunk 数不足以
+ * 触发「每 N 个刷新一次」，导致整步都停在「⚡ —」。首个 text 块因 lastFlushAt 为 0
+ * 会立即刷新，之后每 500 毫秒最多刷新一次。</p>
+ */
+const STATUS_FLUSH_MS = 500
 
 /** 轮播定时器间隔：每 250 毫秒推进一帧点阵旋转图标，计时仍按整秒显示。 */
 const TICKER_TICK_MS = 250
@@ -166,6 +187,26 @@ function clip(text: string, max: number): string {
 function modelLabel(model: string): string {
   const slash = model.lastIndexOf('/')
   return slash >= 0 ? model.slice(slash + 1) : model
+}
+
+/**
+ * 速度档位与颜色：按参考插件的档位说明图分级。
+ *
+ * <p>区间左闭右开（如 40-70 表示 40 ≤ 速度 &lt; 70）；颜色取自该图各档位文字的主色，
+ * 终端会按 256 色近似渲染。label 直接使用区间文本，与图例保持一致。</p>
+ */
+function tpsLevel(tps: number | null): { label: string; color: string } {
+  if (tps === null) return { label: '—', color: 'gray' }
+  if (tps < 40) return { label: '<40', color: '#DF7A68' }
+  if (tps < 70) return { label: '40-70', color: '#C19145' }
+  if (tps < 150) return { label: '70-150', color: '#3AAC85' }
+  if (tps < 200) return { label: '150-200', color: '#2C8F87' }
+  if (tps < 300) return { label: '200-300', color: '#2784B0' }
+  if (tps < 500) return { label: '300-500', color: '#5974D4' }
+  if (tps < 800) return { label: '500-800', color: '#7762CC' }
+  if (tps < 1000) return { label: '800-1000', color: '#8E57C3' }
+  if (tps < 2000) return { label: '1000-2000', color: '#A14FB1' }
+  return { label: '≥2000', color: '#7F62D1' }
 }
 
 
@@ -277,6 +318,20 @@ async function refreshStatus($: EngineInterface): Promise<void> {
 
 /** 注册用量采集相关的事件钩子。 */
 function registerCollectors(on: On): void {
+  // 提交前增强：以 !! 开头的普通消息在回合开始前改写，第一条消息也能用。
+  // 斜杠命令、用户不可见的 meta prompt 和空草稿直接放行；增强失败时按原文提交。
+  on('prompt.submit', async ($, e, next) => {
+    const prefix = SUBMIT_ENHANCE_PREFIXES.find(item => e.text.startsWith(item))
+    if (e.command || e.isMeta || !prefix) return next(e)
+    const original = e.text.slice(prefix.length).trim()
+    if (!original) return next(e)
+
+    $.ui.status('✦ 正在增强提示词…')
+    const enhanced = await enhanceForSubmit($, original)
+    if (enhanced === null) return next(e)
+    return next({ ...e, text: enhanced })
+  })
+
   // 轮次开始：记录起点，供 TTFT 与纯生成耗时使用。
   on('turn.start', async ($, e, next) => {
     const startedAt = await $.clock.now()
@@ -313,8 +368,9 @@ function registerCollectors(on: On): void {
   on('turn.step', async function* ($, e, next) {
     const startedAt = await $.clock.now()
     let firstTextAt: number | null = null
-    let textChars = 0
-    let sampled = 0
+    let firstOutputAt: number | null = null
+    let stepChars = 0
+    let lastFlushAt = 0
     const turn = pending.get(e.turnId)
     if (turn && e.model) turn.model = e.model
 
@@ -336,25 +392,40 @@ function registerCollectors(on: On): void {
     const stream = next(e)
     for await (const chunk of stream) {
       try {
-        if (chunk.kind === 'text' || chunk.kind === 'thinking') {
-          if (firstTextAt === null) {
+        if (chunk.kind === 'text' || chunk.kind === 'thinking' || chunk.kind === 'input') {
+          // TTFT 只由可见文本或思考的首块决定，工具参数不参与首字延迟。
+          if (chunk.kind !== 'input' && firstTextAt === null) {
             const arrivedAt = await $.clock.now()
             firstTextAt = arrivedAt
             if (turn && turn.ttftMs === null) turn.ttftMs = arrivedAt - startedAt
           }
 
+          // 文本、思考与工具参数 JSON 都是模型输出，统一计入实时字符；
+          // 面板速度用 output_tokens，含这三类，实时值与面板口径保持一致。
+          // 三个分支分别取值，不依赖联合类型在条件表达式中的窄化，兼容宿主编译器。
+          let piece = ''
           if (chunk.kind === 'text') {
-            textChars += chunk.text.length
-            sampled += 1
-            if (sampled % 8 === 0) {
-              const now = await $.clock.now()
-              const elapsed = now - startedAt
-              const tps = elapsed > 0 ? textChars / 3.5 / (elapsed / 1000) : null
-              statusCache.lastTps = tps
-              $.ui.status(
-                statusText(tps, Math.round(textChars / 3.5), statusCache.sessionTokens, statusCache.contextPercent, true),
-              )
-            }
+            piece = chunk.text
+          } else if (chunk.kind === 'thinking') {
+            piece = chunk.text
+          } else {
+            piece = chunk.json
+          }
+          stepChars += piece.length
+          const now = await $.clock.now()
+          // 速率分母从首个输出块到达时起算，与分子覆盖同一段 token 产出区间，不含首字前的等待。
+          if (firstOutputAt === null) firstOutputAt = now
+          // 按时间节流：首个输出块（lastFlushAt 为 0）立即刷新，之后每 500 毫秒最多一次。
+          if (now - lastFlushAt >= STATUS_FLUSH_MS) {
+            lastFlushAt = now
+            const elapsed = now - firstOutputAt
+            const tps = elapsed > 0 ? stepChars / 3.5 / (elapsed / 1000) : null
+            // 本轮 = 已完成步骤的真实 output_tokens + 当前步骤的估算值。
+            const roundTokens = (turn?.outputTokens ?? 0) + Math.round(stepChars / 3.5)
+            statusCache.lastTps = tps
+            $.ui.status(
+              statusText(tps, roundTokens, statusCache.sessionTokens, statusCache.contextPercent, true),
+            )
           }
         } else if (chunk.kind === 'stop') {
           const endedAt = await $.clock.now()
@@ -369,13 +440,17 @@ function registerCollectors(on: On): void {
             }
           }
 
-          // 每步结束时把最终估算值推给状态行与实时快照。
-          const elapsed = endedAt - startedAt
-          const finalTps = elapsed > 0 && textChars > 0 ? textChars / 3.5 / (elapsed / 1000) : null
+          // 每步结束时把最终估算值推给状态行与实时快照；分母同样从首个输出块起算。
+          const elapsed = endedAt - (firstOutputAt ?? startedAt)
+          const finalTps = elapsed > 0 && stepChars > 0 ? stepChars / 3.5 / (elapsed / 1000) : null
           if (finalTps !== null) {
+            // usage 已并入 turn.outputTokens 时不再重复加估算；usage 缺失时才用估算补齐。
+            const roundTokens = turn
+              ? turn.outputTokens + (chunk.usage ? 0 : Math.round(stepChars / 3.5))
+              : Math.round(stepChars / 3.5)
             statusCache.lastTps = finalTps
             $.ui.status(
-              statusText(finalTps, Math.round(textChars / 3.5), statusCache.sessionTokens, statusCache.contextPercent, true),
+              statusText(finalTps, roundTokens, statusCache.sessionTokens, statusCache.contextPercent, true),
             )
           }
         }
@@ -414,6 +489,7 @@ function registerCollectors(on: On): void {
         await update($, totals, current => addRoundTotals(current, round))
         await update($, ticker, () => null)
         await refreshStatus($)
+        queueHistorySave($)
       } else {
         const agentId = e.agentId
         await update($, agentTotals, maps => {
@@ -462,6 +538,124 @@ async function loadRecords($: EngineInterface): Promise<void> {
   } catch (error) {
     $.ui.log(`usage-toolbar: 读取增强记录失败 ${String(error)}`)
   }
+}
+
+/** SQLite 存储脚本的命令执行封装：优先 python，回退 python3。 */
+async function runUsageStore(
+  $: EngineInterface,
+  args: string[],
+  stdin?: string,
+): Promise<{ stdout: string; stderr: string }> {
+  const script = `${$.plugin.root}/scripts/usage_store.py`
+  const commands = [
+    ['python', script, ...args],
+    ['python3', script, ...args],
+  ]
+  let lastError = ''
+
+  for (const argv of commands) {
+    try {
+      const result = await $.process.run(argv, { stdin, timeoutMs: 15000 })
+      if (result.exitCode === 0) return { stdout: result.stdout, stderr: result.stderr }
+      lastError = result.stderr || `exit ${result.exitCode}`
+    } catch (error) {
+      lastError = String(error)
+    }
+  }
+
+  throw new Error(lastError || 'python not found')
+}
+
+/** 从本地 SQLite 恢复最近 20 个会话；失败时回退到 $.store 单快照。 */
+async function loadHistory($: EngineInterface): Promise<void> {
+  try {
+    const result = await runUsageStore($, ['load', '20'])
+    const entries = JSON.parse(result.stdout.trim()) as HistoryEntry[]
+    if (Array.isArray(entries)) {
+      await update($, history, () => entries)
+      return
+    }
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 读取 SQLite 历史失败 ${String(error)}`)
+  }
+
+  // 旧版本只写过 $.store 单快照；SQLite 不可用时仍尽力展示它。
+  try {
+    const stored = await $.store.get(HISTORY_STORE_KEY)
+    const candidate = stored as HistoryEntry | null
+    if (candidate && Array.isArray(candidate.rounds) && candidate.sessionId) {
+      await update($, history, () => [candidate])
+    }
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 读取本地历史回退失败 ${String(error)}`)
+  }
+}
+
+/**
+ * 把当前会话的轮次、累计、费用与上下文写入本地 SQLite。
+ *
+ * <p>写入按会话 ID 区分，不并入其他会话统计。SQLite 失败时写 $.store 单快照作为回退。</p>
+ */
+async function saveHistory($: EngineInterface): Promise<void> {
+  let payload: HistoryEntry | null = null
+
+  try {
+    const sessionId = await $.session.id()
+    const [list, current] = await Promise.all([read($, rounds), read($, totals)])
+    let costUsd: number | undefined
+    let contextPercent: number | undefined
+    try {
+      const usage = await $.session.usage()
+      costUsd = usage.cost?.usd
+      contextPercent = usage.context.percent
+    } catch (error) {
+      $.ui.log(`usage-toolbar: 读取历史费用失败 ${String(error)}`)
+    }
+
+    payload = {
+      sessionId,
+      totals: current,
+      rounds: list.slice(-100),
+      costUsd,
+      contextPercent,
+      updatedAt: await $.clock.now(),
+    }
+
+    await runUsageStore($, ['save'], JSON.stringify(payload))
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 保存 SQLite 历史失败 ${String(error)}`)
+    if (payload) {
+      try {
+        await $.store.set(HISTORY_STORE_KEY, payload)
+      } catch (storeError) {
+        $.ui.log(`usage-toolbar: 保存历史回退失败 ${String(storeError)}`)
+      }
+    }
+  }
+}
+
+/** 串行化后台保存，避免同一会话的并发 SQLite 写入互相覆盖。 */
+let historySaving = false
+let historyPending = false
+
+function queueHistorySave($: EngineInterface): void {
+  if (historySaving) {
+    historyPending = true
+    return
+  }
+
+  historySaving = true
+  void (async () => {
+    try {
+      await saveHistory($)
+    } finally {
+      historySaving = false
+      if (historyPending) {
+        historyPending = false
+        queueHistorySave($)
+      }
+    }
+  })()
 }
 
 /** 把模型调用失败原因翻译成用户可读文本。 */
@@ -538,16 +732,7 @@ async function runEnhance($: EngineInterface): Promise<void> {
     }
 
     // 先保存记录再写回草稿，确保写回失败时增强结果仍可查看。
-    let saved: EnhanceRecord[] = []
-    await update($, enhanceRecords, list => {
-      saved = [record, ...list].slice(0, RECORD_LIMIT)
-      return saved
-    })
-    try {
-      await $.store.set(ENHANCE_STORE_KEY, saved)
-    } catch (error) {
-      $.ui.log(`usage-toolbar: 保存增强记录失败 ${String(error)}`)
-    }
+    await rememberEnhance($, record)
 
     if (!isUnchanged) {
       $.ui.toast('草稿已变化，增强结果已保存到记录，未覆盖输入框')
@@ -569,6 +754,87 @@ async function runEnhance($: EngineInterface): Promise<void> {
   } finally {
     await update($, enhanceState, () => null)
     $.ui.status(undefined)
+  }
+}
+
+/**
+ * 保存一条增强记录：先写会话状态，再写跨会话存储。
+ *
+ * <p>存储失败只记日志，不影响已写入的会话状态与写回结果。</p>
+ */
+async function rememberEnhance($: EngineInterface, record: EnhanceRecord): Promise<void> {
+  let saved: EnhanceRecord[] = []
+  await update($, enhanceRecords, list => {
+    saved = [record, ...list].slice(0, RECORD_LIMIT)
+    return saved
+  })
+  try {
+    await $.store.set(ENHANCE_STORE_KEY, saved)
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 保存增强记录失败 ${String(error)}`)
+  }
+}
+
+/**
+ * 提交前增强的触发前缀：消息以其中之一开头时，先改写再发出。
+ *
+ * <p>不用 `!`：Claude Code 把行首 `!` 交给 shell，PowerShell 会把 `!!` 当一元运算符执行，
+ * 消息不会进入 `prompt.submit`。`++` 与中英文冒号的「增强：」都不占用宿主保留前缀。</p>
+ */
+const SUBMIT_ENHANCE_PREFIXES = ['++', '增强：', '增强:']
+
+/**
+ * 提交前增强：把 `!!` 后的草稿交给独立模型改写。
+ *
+ * <p>模型来自当前会话；读取模型、调用失败或结果为空时返回 null，调用方按原文提交，
+ * 绝不阻断发送。成功时与按钮增强共用同一份增强记录，面板的「增强」视图可见。</p>
+ */
+async function enhanceForSubmit($: EngineInterface, original: string): Promise<string | null> {
+  let model: string
+  try {
+    model = await $.session.model()
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 提交前增强读取模型失败 ${String(error)}`)
+    return null
+  }
+
+  const startedAt = await $.clock.now()
+  try {
+    const result = await $.model.complete({
+      model,
+      system:
+        '你是提示词改写助手。只输出改写后的提示词正文，不要解释、不要加引号或前后缀。保持原意，使表达更清晰、具体、可执行。',
+      prompt: original,
+      maxTokens: 2048,
+      effort: 'low',
+    })
+
+    if (!result.isAnswered) {
+      $.ui.log(`usage-toolbar: 提交前增强未返回文本 ${result.reason}`)
+      return null
+    }
+
+    const enhanced = result.text.trim()
+    if (!enhanced) {
+      $.ui.log('usage-toolbar: 提交前增强结果为空')
+      return null
+    }
+
+    const finishedAt = await $.clock.now()
+    await rememberEnhance($, {
+      id: `${startedAt}-${(await read($, enhanceRecords)).length}`,
+      model,
+      original: original.slice(0, TEXT_LIMIT),
+      enhanced: enhanced.slice(0, TEXT_LIMIT),
+      inputTokens: result.usage.input_tokens,
+      outputTokens: result.usage.output_tokens,
+      durationMs: finishedAt - startedAt,
+      at: startedAt,
+    })
+    return enhanced
+  } catch (error) {
+    $.ui.log(`usage-toolbar: 提交前增强异常 ${String(error)}`)
+    return null
   }
 }
 
@@ -661,6 +927,8 @@ function registerUi(on: On): void {
     const sum = await read($, totals)
     const maps = await read($, agentTotals)
     const records = await read($, enhanceRecords)
+    const historyEntries = await read($, history)
+    const selectedHistoryId = await read($, historyView)
 
     let usage: SessionUsage | null = null
     try {
@@ -676,6 +944,23 @@ function registerUi(on: On): void {
       $.ui.log(`usage-toolbar: 面板读取子代理失败 ${String(error)}`)
     }
 
+    // 只展示用户主动选中的历史会话；默认始终展示当前会话，当前会话没有数据时显示空状态，
+    // 避免新会话一打开就看到其他会话的用量。
+    const historyEntry = selectedHistoryId
+      ? historyEntries.find(entry => entry.sessionId === selectedHistoryId) ?? null
+      : null
+
+    // 历史列表排除当前会话：当前会话已由默认视图展示，列表只保留其他会话。
+    let currentSessionId: string | null = null
+    try {
+      currentSessionId = await $.session.id()
+    } catch (error) {
+      $.ui.log(`usage-toolbar: 读取当前会话 id 失败 ${String(error)}`)
+    }
+    const otherHistoryEntries = currentSessionId
+      ? historyEntries.filter(entry => entry.sessionId !== currentSessionId)
+      : historyEntries
+
     // 视图切换：宿主没有原生 Tab，用一排 Button 写入 view 状态。
     const tab = (id: UsageView, label: string) => (
       <Button
@@ -690,16 +975,17 @@ function registerUi(on: On): void {
 
     // 指标卡：标题在上、数值在下；按面板可用列数每行放 4 个，避免右侧被裁。
     const cardWidth = Math.max(10, Math.floor((e.props.bodyColumns - 2) / 4))
-    const metric = (label: string, value: string) => (
+    const metric = (label: string, value: string, color?: string) => (
       <Box flexDirection="column" width={cardWidth}>
         <Text dimColor>{label}</Text>
-        <Text weight="semibold">{value}</Text>
+        <Text weight="semibold" color={color}>{value}</Text>
       </Box>
     )
 
-    // 生成速度视图：最近轮次平均、峰值/最低/最新与字符柱状图。
+    // 生成速度视图：最近轮次平均、峰值/最低/最新与字符柱状图；按速度档位着色。
     const speedView = () => {
-      const recent = list.slice(-18)
+      const sourceRounds = historyEntry ? historyEntry.rounds : list
+      const recent = sourceRounds.slice(-18)
       const totalOut = recent.reduce((n, r) => n + r.outputTokens, 0)
       const totalGen = recent.reduce((n, r) => n + r.genMs, 0)
       const avg = totalGen > 0 ? (totalOut / totalGen) * 1000 : null
@@ -708,37 +994,66 @@ function registerUi(on: On): void {
       const values = recent.map(tpsOfRound).filter(v => v > 0)
       const peak = values.length > 0 ? Math.max(...values) : null
       const low = values.length > 0 ? Math.min(...values) : null
-      const rating = avg === null ? '—' : avg >= 300 ? '极快' : avg >= 200 ? '快速' : avg >= 100 ? '标准' : '较慢'
+      const level = tpsLevel(avg)
       const model = latestRound
         ? clip(modelLabel(latestRound.model), Math.max(10, e.props.bodyColumns - 30))
         : '—'
       const maxTps = peak ?? 1
+      const scope = historyEntry ? `历史会话 ${formatTime(historyEntry.updatedAt)}` : '当前会话'
 
       return (
-        <Box flexDirection="column">
-          <Text dimColor>最近 {recent.length} 轮平均输出速度</Text>
-          <Text weight="bold" size="heading">
+        <Box flexDirection="column" rowGap={1}>
+          <Text dimColor>{scope} · 最近 {recent.length} 轮平均输出速度</Text>
+          <Text color={level.color} weight="bold" size="heading">
             {avg === null ? '—' : avg.toFixed(1)} <Text>t/s</Text>
           </Text>
-          <Text dimColor>{rating} · {model}</Text>
           <Box flexDirection="row">
-            {metric('峰值', peak === null ? '—' : peak.toFixed(1))}
-            {metric('最低', low === null ? '—' : low.toFixed(1))}
-            {metric('最新', latest === null ? '—' : latest.toFixed(1))}
+            <Text color={level.color}>{level.label}</Text>
+            <Text dimColor> · {model}</Text>
+          </Box>
+          <Box flexDirection="row">
+            {metric('峰值', peak === null ? '—' : peak.toFixed(1), tpsLevel(peak).color)}
+            {metric('最低', low === null ? '—' : low.toFixed(1), tpsLevel(low).color)}
+            {metric('最新', latest === null ? '—' : latest.toFixed(1), tpsLevel(latest).color)}
           </Box>
           <Text dimColor>最近 {Math.min(12, recent.length)} 轮生成速度</Text>
           {recent.length === 0 && <Text dimColor>还没有完成的轮次</Text>}
           {recent.slice(-12).map((round, index) => {
             const tps = tpsOfRound(round)
+            const roundLevel = tpsLevel(tps)
             const width = Math.max(1, Math.round((tps / maxTps) * 10))
             return (
               <Box key={round.turnId} flexDirection="row">
                 <Text dimColor>{String(index + 1).padStart(2, ' ')} </Text>
-                <Text>{'█'.repeat(width)}</Text>
-                <Text> {tps.toFixed(1)} t/s</Text>
+                <Text color={roundLevel.color}>{'█'.repeat(width)}</Text>
+                <Text color={roundLevel.color}> {tps.toFixed(1)} t/s</Text>
               </Box>
             )
           })}
+          {otherHistoryEntries.length > 0 && (
+            <Box flexDirection="column" rowGap={1}>
+              <Text dimColor>历史会话</Text>
+              {otherHistoryEntries.slice(0, 5).map(entry => (
+                <Button
+                  key={entry.sessionId}
+                  label={`${formatTime(entry.updatedAt)} · ${fmtTokens(entry.totals.outputTokens)}`}
+                  variant={selectedHistoryId === entry.sessionId ? 'primary' : 'secondary'}
+                  onPress={() => {
+                    void update($, historyView, () => entry.sessionId)
+                  }}
+                />
+              ))}
+              {selectedHistoryId !== null && (
+                <Button
+                  key="current-session"
+                  label="回到当前会话"
+                  onPress={() => {
+                    void update($, historyView, () => null)
+                  }}
+                />
+              )}
+            </Box>
+          )}
         </Box>
       )
     }
@@ -776,32 +1091,36 @@ function registerUi(on: On): void {
       </Box>
     )
 
-    // 会话累计视图：只统计主循环，费用取宿主 /cost 的本地估算。
+    // 会话累计视图：当前会话与选中的历史会话共用同一套卡片，费用取宿主 /cost 的本地估算。
     const sessionView = () => {
-      const total = sum.inputTokens + sum.outputTokens
-      const avgDuration = sum.turns > 0 ? sum.genMs / sum.turns : 0
-      const avgTtft = sum.ttftCount > 0 ? sum.ttftTotalMs / sum.ttftCount : 0
-      const avgTps = sum.genMs > 0 ? (sum.outputTokens / sum.genMs) * 1000 : null
-      const cost = usage?.cost?.usd ?? null
-      const contextPercent = usage?.context.percent ?? null
+      const display = historyEntry ? historyEntry.totals : sum
+      const total = display.inputTokens + display.outputTokens
+      const avgDuration = display.turns > 0 ? display.genMs / display.turns : 0
+      const avgTtft = display.ttftCount > 0 ? display.ttftTotalMs / display.ttftCount : 0
+      const avgTps = display.genMs > 0 ? (display.outputTokens / display.genMs) * 1000 : null
+      const cost = historyEntry ? (historyEntry.costUsd ?? null) : (usage?.cost?.usd ?? null)
+      const contextPercent = historyEntry
+        ? (historyEntry.contextPercent ?? null)
+        : (usage?.context.percent ?? null)
       const tokenWidth = 8
       const requestWidth = 6
       const modelWidth = Math.max(12, e.props.bodyColumns - tokenWidth - requestWidth - 4)
+      const scope = historyEntry ? `历史会话 ${formatTime(historyEntry.updatedAt)}` : '当前会话累计'
 
       return (
         <Box flexDirection="column">
-          <Text dimColor>当前会话累计</Text>
+          <Text dimColor>{scope}</Text>
           <Box flexDirection="row" flexWrap="wrap" rowGap={1}>
             {metric('总用量', fmtTokens(total))}
-            {metric('输入', fmtTokens(sum.inputTokens))}
-            {metric('输出', fmtTokens(sum.outputTokens))}
-            {metric('缓存读取', fmtTokens(sum.cacheReadTokens))}
-            {metric('缓存写入', fmtTokens(sum.cacheCreationTokens))}
-            {metric('请求次数', String(sum.requests))}
-            {metric('轮数', String(sum.turns))}
-            {metric('平均耗时', sum.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—')}
-            {metric('平均延迟', sum.ttftCount > 0 ? `${(avgTtft / 1000).toFixed(1)}s` : '—')}
-            {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`)}
+            {metric('输入', fmtTokens(display.inputTokens))}
+            {metric('输出', fmtTokens(display.outputTokens))}
+            {metric('缓存读取', fmtTokens(display.cacheReadTokens))}
+            {metric('缓存写入', fmtTokens(display.cacheCreationTokens))}
+            {metric('请求次数', String(display.requests))}
+            {metric('轮数', String(display.turns))}
+            {metric('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—')}
+            {metric('平均延迟', display.ttftCount > 0 ? `${(avgTtft / 1000).toFixed(1)}s` : '—')}
+            {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, tpsLevel(avgTps).color)}
             {metric('估算费用', cost === null ? '不可得' : `$${cost.toFixed(2)}`)}
             {metric('上下文', contextPercent === null ? '—' : `${contextPercent}%`)}
           </Box>
@@ -811,8 +1130,8 @@ function registerUi(on: On): void {
             <Box width={tokenWidth} justifyContent="center"><Text dimColor>Token</Text></Box>
             <Box width={requestWidth} justifyContent="center"><Text dimColor>请求</Text></Box>
           </Box>
-          {Object.entries(sum.byModel).length === 0 && <Text dimColor>还没有模型用量</Text>}
-          {Object.entries(sum.byModel).map(([model, modelTotals]) => (
+          {Object.entries(display.byModel).length === 0 && <Text dimColor>还没有模型用量</Text>}
+          {Object.entries(display.byModel).map(([model, modelTotals]) => (
             <Box key={model} flexDirection="row" gap={1}>
               <Box width={modelWidth}><Text>{clip(modelLabel(model), modelWidth)}</Text></Box>
               <Box width={tokenWidth} justifyContent="center">
@@ -824,6 +1143,30 @@ function registerUi(on: On): void {
             </Box>
           ))}
           <Text dimColor>费用为宿主 /cost 的本地估算，不是账单。</Text>
+          {otherHistoryEntries.length > 0 && (
+            <Box flexDirection="column" rowGap={1}>
+              <Text dimColor>历史会话</Text>
+              {otherHistoryEntries.slice(0, 5).map(entry => (
+                <Button
+                  key={entry.sessionId}
+                  label={`${formatTime(entry.updatedAt)} · ${fmtTokens(entry.totals.outputTokens)}`}
+                  variant={selectedHistoryId === entry.sessionId ? 'primary' : 'secondary'}
+                  onPress={() => {
+                    void update($, historyView, () => entry.sessionId)
+                  }}
+                />
+              ))}
+              {selectedHistoryId !== null && (
+                <Button
+                  key="current-session"
+                  label="回到当前会话"
+                  onPress={() => {
+                    void update($, historyView, () => null)
+                  }}
+                />
+              )}
+            </Box>
+          )}
         </Box>
       )
     }
@@ -916,6 +1259,7 @@ export const register: Register = on => {
   // state 在热重载后保留，因此这里不重置用量统计。
   on('session.start', async ($, e, next) => {
     await loadRecords($)
+    void loadHistory($)
     await $.command.register({ name: 'usagebar', description: '打开用量面板' })
     await $.command.register({ name: 'enhance', description: '增强当前输入框草稿' })
     await refreshStatus($)

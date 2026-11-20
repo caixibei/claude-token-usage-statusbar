@@ -107,6 +107,22 @@ export type TickerState = {
   frame: number
 }
 
+/** 一次历史会话的用量快照，按会话 ID 区分。 */
+export type HistoryEntry = {
+  /** 会话 id（transcript 文件名）。 */
+  sessionId: string
+  /** 该会话结束时的累计用量。 */
+  totals: SessionTotals
+  /** 最近 100 轮主会话记录。 */
+  rounds: UsageRound[]
+  /** 会话结束时的估算费用（USD）；宿主无账本时缺省。 */
+  costUsd?: number
+  /** 会话结束时的上下文占比。 */
+  contextPercent?: number
+  /** 快照写入时间（epoch 毫秒）。 */
+  updatedAt: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'usage-toolbar': {
@@ -117,6 +133,8 @@ declare module 'claude-code' {
       enhanceRecords: Shaped<EnhanceRecord[]>
       enhanceState: Shaped<EnhanceState | null>
       ticker: Shaped<TickerState | null>
+      history: Shaped<HistoryEntry[]>
+      historyView: Shaped<string | null>
     }
   }
 }

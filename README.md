@@ -10,8 +10,10 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：实时生成速�
 |---|---|
 | 实时速率 | 生成过程中在输入框下方状态行显示估算速度（t/s）、本轮 token、会话 token 与上下文占比 |
 | 状态轮播 | 输入框上方左侧显示彩色点阵球 + 已用时间 + 趣味语录，每 5 秒换一句；支持 `{elapsed}`、`{tps}`、`{model}` 占位符；空闲时显示「本轮工作已完成」 |
+| 速度分级 | 速度视图按档位着色：`<40`、`40-70`、`70-150`、`150-200`、`200-300`、`300-500`、`500-800`、`800-1000`、`1000-2000`、`≥2000` 共十档，区间左闭右开，颜色取自档位说明图 |
+| 历史会话 | 本地 SQLite 按会话保存最近 100 轮与累计，重启后面板可切换查看最近 20 个会话 |
 | 生成速度明细 | 面板展示最近轮次平均速度、峰值、最低、最新，以及每轮字符柱状图 |
-| 提示词增强 | 输入框上方「✦ 增强」或 `/enhance`，用当前会话模型改写草稿并写回，记录原文、增强文、token 与耗时 |
+| 提示词增强 | 输入框上方「✦ 增强」、`/enhance`，或消息以 `++` / `增强：` 开头时提交前自动改写；用当前会话模型改写，记录原文、增强文、token 与耗时 |
 | 当前会话累计 | 输入/输出/缓存读取/缓存写入、请求次数、轮数、平均耗时、平均延迟、平均速度、估算费用、模型明细 |
 | 子代理用量 | 子代理独立统计，不计入会话累计；显示每个子代理的状态、模型、token、请求数与速度 |
 
@@ -21,7 +23,9 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：实时生成速�
 - **底部状态行**：生成中显示实时估算速度；结束后不显示速率，只保留本轮/会话 token 与上下文占比，例如 `本轮 327 · 会话 289.9万 · 上下文 12%`
 - **`/usagebar`**：打开用量面板（宿主已保留 `/usage`，因此命令名为 `usagebar`）
 - **`/enhance`**：增强当前输入框草稿
+- **发送前增强**：消息以 `++` 或 `增强：` 开头时，提交前用当前模型改写再发出；第一条消息也能用，普通消息不受影响。不要用 `!`：宿主会把行首 `!` 交给 shell
 - **面板四个视图**：速度、增强、会话、代理；面板以对话框形态打开，Esc 关闭
+- **历史会话**：速度与会话视图底部列出其他最近会话，点击切换查看；默认始终显示当前会话，列表不含当前会话；「回到当前会话」返回实时统计
 
 ### 状态轮播
 
@@ -34,7 +38,7 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：实时生成速�
 
 | 指标 | 数据来源 | 口径说明 |
 |---|---|---|
-| 实时速度 | `turn.step` 的 `text` 流式块 | 字符增量 ÷ 3.5 ≈ token，再除以已生成时间；是**估算值** |
+| 实时速度 | `turn.step` 的 `text`、`thinking`、`input` 流式块 | 字符增量 ÷ 3.5 ≈ token，再除以「首个输出块到达后」的已生成时间；分子分母覆盖同一段 token 产出区间，不含首字等待；是**估算值** |
 | 首字延迟 | `turn.step` 首个 `text`/`thinking` 块 | 首个块到达时间 − 该步请求开始时间 |
 | 每轮速度 | `turn.complete.usage.output_tokens` | 输出 token ÷ 各步纯生成耗时之和，不含工具等待 |
 | 会话累计 | `turn.complete.usage` 逐轮累加 | 只统计主循环；中断或 API 错误时缺失的 usage 按 0 处理 |
@@ -44,7 +48,8 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：实时生成速�
 | 上下文占比 | `$.session.usage().context.percent` | 最近一次响应的输入侧占模型窗口比例 |
 | 估算费用 | `$.session.usage().cost.usd` | 宿主 `/cost` 的本地估算，不是账单；第三方模型可能显示「不可得」 |
 | 子代理用量 | `$.agent.list()` + `turn.step` 的 `agentId` | `tokenCount`/`usage`/`cost` 来自 AgentInfo，请求数与轮数自行计数 |
-| 提示词增强 | `$.prompt.read()` → `$.model.complete()` → `$.prompt.fill()` | 独立调用，不带会话上下文，成本更低；写回前二次读取草稿，用户改过则不覆盖 |
+| 历史会话 | `$.process.run` 调用 `scripts/usage_store.py` | 数据库 `~/.claude/usage-toolbar/usage.db`，按 `session.id()` 分会话，保留最近 20 个；当前会话统计不混入历史 |
+| 提示词增强 | `$.prompt.read()` → `$.model.complete()` → `$.prompt.fill()`；`++` / `增强：` 前缀走 `prompt.submit` | 独立调用，不带会话上下文，成本更低；写回前二次读取草稿，用户改过则不覆盖；前缀在提交前直接改写发送文本 |
 
 ```mermaid
 graph LR
@@ -60,7 +65,7 @@ graph LR
 
 ## 安装
 
-前置条件：Claude Desktop / Claude Code 2.1.326 或更新版本；不需要 Node.js，也没有第三方依赖。
+前置条件：Claude Desktop / Claude Code 2.1.326 或更新版本；Python 3（标准库 sqlite3，用于历史用量存储）；不需要 Node.js 或第三方 Python 包。
 
 ### 方式一：桌面端插件界面（日常使用推荐）
 
@@ -128,6 +133,8 @@ claude plugin install usage-toolbar --marketplace <owner>/<repo>
 ├── hooks/
 │   ├── hooks.json         # 模块声明
 │   └── register.tsx       # 采集、增强、绘制、命令
+├── scripts/
+│   └── usage_store.py     # SQLite 历史存储（Python 标准库）
 ├── types/
 │   └── index.d.ts         # 状态契约
 ├── README.md
@@ -146,6 +153,9 @@ claude plugin validate <本目录>
 
 # 类型检查（先让 mod 加载一次，生成 .claude-plugin/types/tsconfig.json）
 tsc -p <本目录>
+
+# 确认 Python 与 sqlite3 可用
+python -c "import sqlite3; print(sqlite3.sqlite_version)"
 ```
 
 - 保存文件后，热重载在本次回合结束或新会话时生效。
@@ -158,6 +168,8 @@ tsc -p <本目录>
 - 实时速度是字符估算，真实值在每步或每轮结束时回填。
 - 费用是宿主 `/cost` 的本地估算，不是账单；第三方模型可能没有已知价格。
 - 子代理请求次数由 `turn.step` 自行计数，宿主不提供现成字段。
+- 历史会话需要本机 Python 3；SQLite 不可用时回退到宿主 `$.store` 的单会话快照。
+- 历史费用与上下文是会话结束时的快照，不是账单；历史会话的费用可能显示「不可得」。
 - 回答末尾速率行未实现：`TurnDuration` 只在终端 surface 触发，Desktop 不绘制。
 - 面板按窄侧栏约 30 列优化；更宽时内容会留白，不会溢出。
 
