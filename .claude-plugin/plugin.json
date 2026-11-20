@@ -1,8 +1,28 @@
 {
   "name": "usage-toolbar",
-  "version": "0.2.31",
+  "version": "0.2.34",
   "description": "TPS, session usage, subagent usage and prompt enhancement toolbar for Claude Desktop",
   "author": { "name": "caixi" },
   "license": "MIT",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "latencyTealMaxSec": {
+      "type": "number",
+      "title": "延迟青色上限（秒）",
+      "description": "平均首字延迟低于该值为青色（优秀），默认 2",
+      "default": 2
+    },
+    "latencyGreenMaxSec": {
+      "type": "number",
+      "title": "延迟绿色上限（秒）",
+      "description": "低于该值为绿色（良好），须大于青色上限，默认 4",
+      "default": 4
+    },
+    "latencyYellowMaxSec": {
+      "type": "number",
+      "title": "延迟黄色上限（秒）",
+      "description": "低于该值为黄色（偏慢），达到或超过为红色告警；须大于绿色上限，默认 8",
+      "default": 8
+    }
+  }
 }

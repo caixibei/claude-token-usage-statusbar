@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { AgentInfo, EngineInterface, On, Register, SessionUsage } from 'claude-code'
+import type { AgentInfo, EngineInterface, On, PluginOptions, Register, SessionUsage } from 'claude-code'
 
 import type {
   AgentTotals,
@@ -286,6 +286,74 @@ const statusCache = {
   sessionTokens: 0,
   contextPercent: null as number | null,
   lastTps: null as number | null,
+}
+
+/** 延迟分档默认阈值（秒）：<2 青、2–4 绿、4–8 黄、≥8 红。 */
+const DEFAULT_LATENCY_BOUNDS_SEC = [2, 4, 8] as const
+/** 延迟分档颜色：与缓存率同一套语义，青=最佳、绿=良好、黄=偏慢、红=告警。 */
+const LATENCY_COLORS = {
+  teal: '#2C8F87',
+  green: '#3AAC85',
+  yellow: 'warning',
+  red: 'error',
+} as const
+
+type LatencyTier = { maxMs: number; color: string }
+
+/** 默认延迟分档（毫秒）；阈值来自 userConfig，未配置或无效时使用这一组。 */
+function defaultLatencyTiers(): LatencyTier[] {
+  return [
+    { maxMs: DEFAULT_LATENCY_BOUNDS_SEC[0] * 1000, color: LATENCY_COLORS.teal },
+    { maxMs: DEFAULT_LATENCY_BOUNDS_SEC[1] * 1000, color: LATENCY_COLORS.green },
+    { maxMs: DEFAULT_LATENCY_BOUNDS_SEC[2] * 1000, color: LATENCY_COLORS.yellow },
+  ]
+}
+
+/** 当前生效的延迟分档；register 时按 userConfig 重建，模块重载即回到默认值。 */
+let latencyTiers: LatencyTier[] = defaultLatencyTiers()
+/** 阈值配置无效时的回退原因，由 session.start 写调试日志。 */
+let latencyConfigIssue: string | null = null
+
+/** 延迟（毫秒）对应颜色：升序阈值左闭右开；无样本不着色，超过黄色上限为红色。 */
+function latencyColor(ms: number | null): string | undefined {
+  if (ms === null) return undefined
+  for (const tier of latencyTiers) {
+    if (ms < tier.maxMs) return tier.color
+  }
+  return LATENCY_COLORS.red
+}
+
+/**
+ * 按 userConfig 重建延迟分档。
+ *
+ * <p>字段：latencyTealMaxSec / latencyGreenMaxSec / latencyYellowMaxSec（秒），
+ * 默认 2 / 4 / 8。单个值缺失或非正数时按该项默认值补齐；三者未严格递增时整体回退
+ * 默认值，并在 session.start 写一条调试日志；宿主已按 number 类型校验，这里只检查业务约束。</p>
+ */
+function applyLatencyConfig(options: PluginOptions): void {
+  const read = (key: string, fallback: number): number => {
+    const raw = options[key]
+    const value = typeof raw === 'number' ? raw : Number(raw)
+    return Number.isFinite(value) && value > 0 ? value : fallback
+  }
+
+  const bounds: [number, number, number] = [
+    read('latencyTealMaxSec', DEFAULT_LATENCY_BOUNDS_SEC[0]),
+    read('latencyGreenMaxSec', DEFAULT_LATENCY_BOUNDS_SEC[1]),
+    read('latencyYellowMaxSec', DEFAULT_LATENCY_BOUNDS_SEC[2]),
+  ]
+  if (bounds[0] < bounds[1] && bounds[1] < bounds[2]) {
+    latencyTiers = [
+      { maxMs: bounds[0] * 1000, color: LATENCY_COLORS.teal },
+      { maxMs: bounds[1] * 1000, color: LATENCY_COLORS.green },
+      { maxMs: bounds[2] * 1000, color: LATENCY_COLORS.yellow },
+    ]
+    latencyConfigIssue = null
+    return
+  }
+
+  latencyTiers = defaultLatencyTiers()
+  latencyConfigIssue = `延迟阈值未严格递增（${bounds.join('/')} 秒），已回退默认 ${DEFAULT_LATENCY_BOUNDS_SEC.join('/')} 秒`
 }
 
 function emptyAgent(): AgentTotals {
@@ -1454,7 +1522,7 @@ function registerUi(on: On): void {
             {metric('请求次数', String(display.requests))}
             {metric('轮数', String(display.turns))}
             {metric('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—')}
-            {metric('平均延迟', display.ttftCount > 0 ? `${(avgTtft / 1000).toFixed(1)}s` : '—')}
+            {metric('平均延迟', display.ttftCount > 0 ? `${(avgTtft / 1000).toFixed(1)}s` : '—', latencyColor(display.ttftCount > 0 ? avgTtft : null))}
             {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, tpsLevel(avgTps).color)}
             {metric('估算费用', cost === null ? '不可得' : `$${cost.toFixed(2)}`)}
             {metric('上下文', contextPercent === null ? '—' : `${contextPercent}%`)}
@@ -1660,7 +1728,9 @@ function registerUi(on: On): void {
 // 注册
 // ---------------------------------------------------------------------------
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  // 延迟分档阈值来自 userConfig；/config 改动会重新加载模块并再次执行这里。
+  applyLatencyConfig(options)
   registerCollectors(on)
   registerUi(on)
 
@@ -1696,6 +1766,10 @@ export const register: Register = on => {
   // 用量统计不在这里重置：热重载保留状态，应用重启后由 loadHistory 末尾的回填恢复。
   on('session.start', async ($, e, next) => {
     await loadRecords($)
+    // 阈值配置无效时已回退默认值，这里补一条调试日志便于定位。
+    if (latencyConfigIssue) {
+      $.ui.log(`usage-toolbar: ${latencyConfigIssue}`, { to: 'debug' })
+    }
     void startHistoryLoad($)
     await $.command.register({ name: 'usagebar', description: '打开用量面板' })
     await $.command.register({ name: 'enhance', description: '增强当前输入框草稿' })

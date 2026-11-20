@@ -37,12 +37,36 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：实时生成速�
 - 语录支持占位符 `{elapsed}`、`{tps}`、`{model}`。
 - 空闲时显示「本轮工作已完成，随时可以继续」，不显示速率；尚未开始过轮次时显示「准备就绪」。
 
+### 延迟分档配置
+
+平均延迟按四档着色：`<2s` 青色、`2–4s` 绿色、`4–8s` 黄色、`≥8s` 红色；区间左闭右开，与缓存率共用同一套颜色语义（青=最佳、绿=良好、黄=偏慢、红=告警）。
+
+阈值通过插件 `userConfig` 配置，`/config` 中对应 `usage-toolbar.latencyTealMaxSec`、`usage-toolbar.latencyGreenMaxSec`、`usage-toolbar.latencyYellowMaxSec`（单位：秒）；也可以直接写入 `~/.claude/settings.json`：
+
+```json
+{
+  "pluginConfigs": {
+    "usage-toolbar": {
+      "options": {
+        "latencyTealMaxSec": 2,
+        "latencyGreenMaxSec": 4,
+        "latencyYellowMaxSec": 8
+      }
+    }
+  }
+}
+```
+
+- 三个值必须为正数且严格递增；否则整体回退默认 2/4/8，并在调试日志记录回退原因。
+- 配置改动会在插件重新加载后生效。
+
 ## 数据口径
 
 | 指标 | 数据来源 | 口径说明 |
 |---|---|---|
 | 实时速度 | `turn.step` 的 `text`、`thinking`、`input` 流式块 | 字符增量 ÷ 3.5 ≈ token，再除以「首个输出块到达后」的已生成时间；分子分母覆盖同一段 token 产出区间，不含首字等待；是**估算值** |
 | 首字延迟 | `turn.step` 首个 `text`/`thinking` 块 | 首个块到达时间 − 该步请求开始时间 |
+| 平均延迟分档 | 会话累计的 TTFT 平均值 | `<2s` 青色、`2–4s` 绿色、`4–8s` 黄色、`≥8s` 红色；阈值可由 `userConfig` 覆盖（见「延迟分档配置」）；区间左闭右开，无样本不着色 |
 | 每轮速度 | `turn.complete.usage.output_tokens` | 输出 token ÷ 各步纯生成耗时之和，不含工具等待 |
 | 会话累计 | `turn.complete.usage` 逐轮累加 | 只统计主循环；中断或 API 错误时缺失的 usage 按 0 处理 |
 | 缓存率 | 会话累计与模型明细的输入侧字段 | 缓存读取 ÷（未缓存输入 + 缓存读取 + 缓存写入）；输入侧为 0 时显示「—」；模型明细按模型分别计算。分档：<80% 红色告警、80–90% 黄色告警、90–95% 绿色、≥95% 青色；区间左闭右开 |
