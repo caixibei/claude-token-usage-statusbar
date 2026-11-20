@@ -288,39 +288,46 @@ const statusCache = {
   lastTps: null as number | null,
 }
 
-/** 延迟分档默认阈值（秒）：<2 青、2–4 绿、4–8 黄、≥8 红。 */
-const DEFAULT_LATENCY_BOUNDS_SEC = [2, 4, 8] as const
-/** 延迟分档颜色：与缓存率同一套语义，青=最佳、绿=良好、黄=偏慢、红=告警。 */
-const LATENCY_COLORS = {
+/** 指标分档颜色：青=最佳、绿=良好、黄=偏慢/偏高、红=告警；与缓存率同一套语义。 */
+const TIER_COLORS = {
   teal: '#2C8F87',
   green: '#3AAC85',
   yellow: 'warning',
   red: 'error',
 } as const
 
-type LatencyTier = { maxMs: number; color: string }
+/** 三档升序阈值；比较一律左闭右开，达到最后一档为红色。 */
+type TierBounds = readonly [number, number, number]
 
-/** 默认延迟分档（毫秒）；阈值来自 userConfig，未配置或无效时使用这一组。 */
-function defaultLatencyTiers(): LatencyTier[] {
-  return [
-    { maxMs: DEFAULT_LATENCY_BOUNDS_SEC[0] * 1000, color: LATENCY_COLORS.teal },
-    { maxMs: DEFAULT_LATENCY_BOUNDS_SEC[1] * 1000, color: LATENCY_COLORS.green },
-    { maxMs: DEFAULT_LATENCY_BOUNDS_SEC[2] * 1000, color: LATENCY_COLORS.yellow },
-  ]
+/** 升序阈值取档：低于首阈为青，随后绿、黄，达到末阈为红；无读数不着色。 */
+function tierColor(value: number | null, bounds: TierBounds): string | undefined {
+  if (value === null) return undefined
+  if (value < bounds[0]) return TIER_COLORS.teal
+  if (value < bounds[1]) return TIER_COLORS.green
+  if (value < bounds[2]) return TIER_COLORS.yellow
+  return TIER_COLORS.red
 }
 
-/** 当前生效的延迟分档；register 时按 userConfig 重建，模块重载即回到默认值。 */
-let latencyTiers: LatencyTier[] = defaultLatencyTiers()
+/** 平均耗时阈值（毫秒）：<10s 青、10–30s 绿、30–60s 黄、≥60s 红；越低越好。 */
+const DURATION_BOUNDS_MS: TierBounds = [10_000, 30_000, 60_000]
+/** 上下文占比阈值（百分比）：<40 青、40–60 绿、60–80 黄、≥80 红；越高越接近压缩阈值。 */
+const CONTEXT_BOUNDS_PERCENT: TierBounds = [40, 60, 80]
+/** 延迟默认阈值（秒）：<2 青、2–4 绿、4–8 黄、≥8 红；可由 userConfig 覆盖。 */
+const DEFAULT_LATENCY_BOUNDS_SEC: TierBounds = [2, 4, 8]
+
+/** 秒阈值换算为毫秒。 */
+function latencyBoundsMs(sec: TierBounds): TierBounds {
+  return [sec[0] * 1000, sec[1] * 1000, sec[2] * 1000]
+}
+
+/** 当前生效的延迟阈值（毫秒）；register 时按 userConfig 重建，模块重载即回到默认值。 */
+let latencyBounds: TierBounds = latencyBoundsMs(DEFAULT_LATENCY_BOUNDS_SEC)
 /** 阈值配置无效时的回退原因，由 session.start 写调试日志。 */
 let latencyConfigIssue: string | null = null
 
-/** 延迟（毫秒）对应颜色：升序阈值左闭右开；无样本不着色，超过黄色上限为红色。 */
+/** 延迟（毫秒）对应颜色：升序阈值左闭右开；无样本不着色。 */
 function latencyColor(ms: number | null): string | undefined {
-  if (ms === null) return undefined
-  for (const tier of latencyTiers) {
-    if (ms < tier.maxMs) return tier.color
-  }
-  return LATENCY_COLORS.red
+  return tierColor(ms, latencyBounds)
 }
 
 /**
@@ -343,16 +350,12 @@ function applyLatencyConfig(options: PluginOptions): void {
     read('latencyYellowMaxSec', DEFAULT_LATENCY_BOUNDS_SEC[2]),
   ]
   if (bounds[0] < bounds[1] && bounds[1] < bounds[2]) {
-    latencyTiers = [
-      { maxMs: bounds[0] * 1000, color: LATENCY_COLORS.teal },
-      { maxMs: bounds[1] * 1000, color: LATENCY_COLORS.green },
-      { maxMs: bounds[2] * 1000, color: LATENCY_COLORS.yellow },
-    ]
+    latencyBounds = latencyBoundsMs(bounds)
     latencyConfigIssue = null
     return
   }
 
-  latencyTiers = defaultLatencyTiers()
+  latencyBounds = latencyBoundsMs(DEFAULT_LATENCY_BOUNDS_SEC)
   latencyConfigIssue = `延迟阈值未严格递增（${bounds.join('/')} 秒），已回退默认 ${DEFAULT_LATENCY_BOUNDS_SEC.join('/')} 秒`
 }
 
@@ -1521,11 +1524,11 @@ function registerUi(on: On): void {
             {metric('缓存率', cacheRate === null ? '—' : `${cacheRate.toFixed(1)}%`, cacheRateLevel(cacheRate))}
             {metric('请求次数', String(display.requests))}
             {metric('轮数', String(display.turns))}
-            {metric('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—')}
+            {metric('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—', tierColor(display.turns > 0 ? avgDuration : null, DURATION_BOUNDS_MS))}
             {metric('平均延迟', display.ttftCount > 0 ? `${(avgTtft / 1000).toFixed(1)}s` : '—', latencyColor(display.ttftCount > 0 ? avgTtft : null))}
             {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, tpsLevel(avgTps).color)}
             {metric('估算费用', cost === null ? '不可得' : `$${cost.toFixed(2)}`)}
-            {metric('上下文', contextPercent === null ? '—' : `${contextPercent}%`)}
+            {metric('上下文', contextPercent === null ? '—' : `${contextPercent}%`, tierColor(contextPercent, CONTEXT_BOUNDS_PERCENT))}
           </Box>
           {/* 与上方指标卡拉开一行，避免两个区块黏在一起。 */}
           <Text>{' '}</Text>
