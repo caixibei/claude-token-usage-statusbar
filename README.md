@@ -31,6 +31,10 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：⚡ 实时生成�
 
 ## 🖥️ 界面与使用
 
+![usage-toolbar 界面总览：右侧用量面板的会话视图，输入框上方状态轮播与增强/用量入口，底部实时速率行](assets/overview.png)
+
+> 图中标注了三处入口：右侧「▦ 用量」面板的会话视图，输入框上方的状态轮播，以及底部状态行的实时速率与本轮/会话 token、上下文占比。
+
 - 🖋️ **输入框上方**：左侧为状态轮播；右上方 `✦ 增强`（改写当前草稿）、`▦ 用量`（打开用量面板）
 - 📉 **底部状态行**：生成中显示实时估算速度；结束后不显示速率，只保留本轮/会话 token 与上下文占比，例如 `本轮 327 · 会话 289.9万 · 上下文 12%`
 - ⌨️ **`/usagebar`**：打开用量面板（宿主已保留 `/usage`，因此命令名为 `usagebar`）
@@ -193,6 +197,8 @@ claude plugin install usage-toolbar --marketplace <owner>/<repo>
 │   └── usage_store.py     # SQLite 历史存储（Python 标准库）
 ├── types/
 │   └── index.d.ts         # 状态契约
+├── assets/
+│   └── overview.png       # 界面总览截图（README 引用）
 ├── README.md
 └── LICENSE
 ```
