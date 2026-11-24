@@ -1671,9 +1671,10 @@ function registerUi(on: On): void {
 
     // 生成速度视图：平均速度、档位、峰值/最低/最新与按面板宽度铺开的轮次条。
     const speedView = () => {
-      // 统计基准取最近 20 轮：既贴近当前速度水平，也是宽面板柱状图在最窄画布（540px）
-      // 下逐根标注读数所能容纳的上限。
-      const recent = list.slice(-20)
+      // 面板够宽才画柱状图：每轮占一列，540px 画布只容得下 20 根；窄面板与终端每轮
+      // 一行，纵向可铺开 50 轮。统计窗口跟随展示窗口，顶部平均值与下方图形口径一致。
+      const wide = e.surface !== 'terminal' && e.props.bodyColumns >= 64
+      const recent = list.slice(-(wide ? 20 : 50))
       const totalOut = recent.reduce((n, r) => n + r.outputTokens, 0)
       const totalGen = recent.reduce((n, r) => n + r.genMs, 0)
       const avg = totalGen > 0 ? (totalOut / totalGen) * 1000 : null
@@ -1696,7 +1697,7 @@ function registerUi(on: On): void {
       // 折线画在条形图上方：只用基础 SVG 图元，面板足够宽且至少 2 轮时才绘制，
       // 窄侧栏或终端退回条形图，不出现半截图。
       const trend = rows.map(tpsOfRound)
-      const showChart = e.surface !== 'terminal' && e.props.bodyColumns >= 64 && trend.length >= 2
+      const showChart = wide && trend.length >= 2
       // 图表像素宽度随面板列数增长：每列按 7.6px 保守估算（宁可略窄也不越过槽位），下界 540 保持窄面板
       // 刻度不被压缩，上界 1080 避免超宽面板把绘图区拉成细线。高度按宽度小幅补偿，视觉比例不失衡。
       const chartWidth = Math.min(1080, Math.max(540, Math.round(e.props.bodyColumns * 7.6)))
@@ -1732,10 +1733,11 @@ function registerUi(on: On): void {
               height={chartHeight}
             />
           )}
-          {/* 峰值/最低/最新并列一行；「最低」是统计量，保持中性色，避免被误读成告警。 */}
+          {/* 峰值/最低/最新并列一行，三个数值统一按自身速度档位着色，与下方轮次条共用
+              同一套颜色语义：同一读数在指标行和图表里必须是同一个颜色。 */}
           <Box flexDirection="row" gap={2}>
             {compactMetric('峰值', peak === null ? '—' : peak.toFixed(1), tpsLevel(peak).color)}
-            {compactMetric('最低', low === null ? '—' : low.toFixed(1))}
+            {compactMetric('最低', low === null ? '—' : low.toFixed(1), tpsLevel(low).color)}
             {compactMetric('最新', latest === null ? '—' : latest.toFixed(1), tpsLevel(latest).color)}
           </Box>
           {rows.length === 0 ? (
