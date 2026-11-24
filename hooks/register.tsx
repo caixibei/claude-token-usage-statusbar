@@ -362,9 +362,10 @@ function speedChartSvg(points: readonly number[], color: string, width = 560, he
 /**
  * 生成轮次柱状图 SVG：每轮一根柱，柱顶标速度、底部标轮次序号、左侧标速度刻度。
  *
- * <p>柱宽按轮次数均分可用宽度，单根上限 56px，避免宽面板下柱子过细而疏；柱顶数值用
- * 9px 等宽字体，与相邻柱不重叠。宽度由调用方按面板可用列数传入，字号不随宽度放大。
- * 柱色由调用方按该轮档位传入，和折线图、指标卡保持同一套颜色语义。
+ * <p>柱宽按轮次数均分可用宽度，单根上限 56px，避免宽面板下柱子过细而疏。柱顶数值与
+ * 底部序号在步距不足时按间隔稀疏标注：从最新一根向前数，保证最右侧轮次一定有编号与
+ * 读数；轮次少、步距够宽时步距为 1，退化为逐根标注。宽度由调用方按面板可用列数传入，
+ * 字号不随宽度放大。柱色由调用方按该轮档位传入，和折线图、指标卡保持同一套颜色语义。
  * 无数据时返回空串，由调用方退回字符条形图。</p>
  */
 function speedBarsSvg(values: readonly number[], colors: readonly string[], width = 560, height = 160): string {
@@ -387,6 +388,14 @@ function speedBarsSvg(values: readonly number[], colors: readonly string[], widt
       return `<line x1="${left}" y1="${gy.toFixed(1)}" x2="${width - right}" y2="${gy.toFixed(1)}" stroke="rgba(127,127,127,0.22)" stroke-width="1" stroke-dasharray="3 4"/><text x="${left - 6}" y="${(gy + 3).toFixed(1)}" text-anchor="end" font-family="monospace" font-size="9" fill="${SVG_LABEL_COLOR}">${label}</text>`
     })
     .join('')
+  // 柱顶数值与底部序号按步距稀疏标注：50 轮时 slot 只有 10–20px，逐根标会互相压住。
+  // 从最右一根向前每隔 stride 根标一次，保证最新轮次一定有读数；轮次少时 stride 为 1，
+  // 与逐根标注完全等价。
+  // 柱顶读数实际最长宽度（9px 等宽约 5.4px/字符）决定步距：18 根柱、读数 4 字符时
+  // 仍逐根标注，出现 3 位数读数才隔根。
+  const labelWidth = Math.max(...values.map(value => value.toFixed(1).length)) * 5.4 + 2
+  const valueStride = Math.max(1, Math.ceil(labelWidth / slot))
+  const indexStride = Math.max(1, Math.ceil(16 / slot))
   const bars = values
     .map((value, index) => {
       const x = left + index * slot + (slot - barW) / 2
@@ -394,7 +403,16 @@ function speedBarsSvg(values: readonly number[], colors: readonly string[], widt
       const y = baseline - barHeight
       const labelY = Math.max(top + 9, y - 4)
       const centerX = x + barW / 2
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="2" fill="${colors[index] ?? '#3AAC85'}"/><text x="${centerX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-family="monospace" font-size="9" fill="${SVG_LABEL_COLOR}">${value.toFixed(1)}</text><text x="${centerX.toFixed(1)}" y="${(height - 6).toFixed(1)}" text-anchor="middle" font-family="monospace" font-size="9" fill="${SVG_LABEL_COLOR}">${index + 1}</text>`
+      const fromEnd = values.length - 1 - index
+      const valueText =
+        fromEnd % valueStride === 0
+          ? `<text x="${centerX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-family="monospace" font-size="9" fill="${SVG_LABEL_COLOR}">${value.toFixed(1)}</text>`
+          : ''
+      const indexText =
+        fromEnd % indexStride === 0
+          ? `<text x="${centerX.toFixed(1)}" y="${(height - 6).toFixed(1)}" text-anchor="middle" font-family="monospace" font-size="9" fill="${SVG_LABEL_COLOR}">${index + 1}</text>`
+          : ''
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="2" fill="${colors[index] ?? '#3AAC85'}"/>${valueText}${indexText}`
     })
     .join('')
 
@@ -1653,7 +1671,9 @@ function registerUi(on: On): void {
 
     // 生成速度视图：平均速度、档位、峰值/最低/最新与按面板宽度铺开的轮次条。
     const speedView = () => {
-      const recent = list.slice(-18)
+      // 统计基准取最近 20 轮：既贴近当前速度水平，也是宽面板柱状图在最窄画布（540px）
+      // 下逐根标注读数所能容纳的上限。
+      const recent = list.slice(-20)
       const totalOut = recent.reduce((n, r) => n + r.outputTokens, 0)
       const totalGen = recent.reduce((n, r) => n + r.genMs, 0)
       const avg = totalGen > 0 ? (totalOut / totalGen) * 1000 : null
@@ -1666,7 +1686,10 @@ function registerUi(on: On): void {
       const model = latestRound
         ? clip(modelLabel(latestRound.model), Math.max(10, e.props.bodyColumns - 30))
         : '—'
-      const rows = recent.slice(-12)
+      const rows = recent
+      // 窄面板块条每轮一行、纵向不受画布宽度限制，展示最近 50 轮完整历史；
+      // 宽面板柱状图受柱宽与柱顶数值限制，仍用上面的 rows。
+      const narrowRows = list.slice(-50)
       const maxTps = peak ?? 1
       // 条形区按面板可用列数分配，并给编号和数值留固定列，保证纵向扫读时数字对齐。
       const barMax = Math.max(6, e.props.bodyColumns - 20)
@@ -1686,7 +1709,7 @@ function registerUi(on: On): void {
       // 窄面板块条：序号 2 列 + 间距 + 数值 6 列，其余列给条；按 7px/列保守换算，
       // 宁可条略窄也不让整行越过面板宽度。数值省略 " t/s"，单位已在标题里标明。
       const narrowBarPx = Math.max(40, Math.round((e.props.bodyColumns - 10) * 7))
-      const rowMaxTps = Math.max(1, ...trend)
+      const rowMaxTps = Math.max(1, ...narrowRows.map(tpsOfRound))
 
       return (
         <Box flexDirection="column" gap={1}>
@@ -1751,9 +1774,9 @@ function registerUi(on: On): void {
             // 窄面板用分格块条：序号与速率交给宿主 Text 排版，SVG 只画格子；三段各占一列，
             // 字体度量再大也不会压住数字。数值省略单位；标题与图表之间用 marginTop 留一行间距。
             <Box flexDirection="column">
-              <Text size="caption" weight="bold">最近 {rows.length} 轮生成速度（t/s）</Text>
+              <Text size="caption" weight="bold">最近 {narrowRows.length} 轮生成速度（t/s）</Text>
               <Box flexDirection="column" marginTop={1}>
-                {rows.map((round, index) => {
+                {narrowRows.map((round, index) => {
                   const tps = tpsOfRound(round)
                   const roundLevel = tpsLevel(tps)
                   return (
