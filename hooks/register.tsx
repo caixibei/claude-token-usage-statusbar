@@ -515,6 +515,8 @@ const DURATION_BOUNDS_MS: TierBounds = [10_000, 30_000, 60_000]
 const CONTEXT_BOUNDS_PERCENT: TierBounds = [40, 60, 80]
 /** 延迟默认阈值（秒）：<2 青、2–4 绿、4–8 黄、≥8 红；可由 userConfig 覆盖。 */
 const DEFAULT_LATENCY_BOUNDS_SEC: TierBounds = [2, 4, 8]
+/** 速度块条满格基准默认值（t/s）：达到该值点亮全部格子；可由 userConfig 覆盖。 */
+const DEFAULT_BAR_FULL_SCALE_TPS = 300
 
 /** 秒阈值换算为毫秒。 */
 function latencyBoundsMs(sec: TierBounds): TierBounds {
@@ -525,6 +527,10 @@ function latencyBoundsMs(sec: TierBounds): TierBounds {
 let latencyBounds: TierBounds = latencyBoundsMs(DEFAULT_LATENCY_BOUNDS_SEC)
 /** 阈值配置无效时的回退原因，由 session.start 写调试日志。 */
 let latencyConfigIssue: string | null = null
+/** 当前生效的速度块条满格基准（t/s）；register 时按 userConfig 重建，模块重载即回到默认值。 */
+let barFullScaleTps = DEFAULT_BAR_FULL_SCALE_TPS
+/** 块条基准配置无效时的回退原因，由 session.start 写调试日志。 */
+let speedConfigIssue: string | null = null
 
 /** 延迟（毫秒）对应颜色：升序阈值左闭右开；无样本不着色。 */
 function latencyColor(ms: number | null): string | undefined {
@@ -558,6 +564,25 @@ function applyLatencyConfig(options: PluginOptions): void {
 
   latencyBounds = latencyBoundsMs(DEFAULT_LATENCY_BOUNDS_SEC)
   latencyConfigIssue = `延迟阈值未严格递增（${bounds.join('/')} 秒），已回退默认 ${DEFAULT_LATENCY_BOUNDS_SEC.join('/')} 秒`
+}
+
+/**
+ * 按 userConfig 重建速度块条满格基准。
+ *
+ * <p>字段：barFullScaleTps（t/s），默认 300。缺失、非数值或非正数时回退默认值，并在
+ * session.start 写一条调试日志；宿主已按 number 类型校验，这里只检查业务约束。达到
+ * 该值点亮全部格子，低于则按比例缩短；峰值超过基准时由调用方按峰值向上取整扩展。</p>
+ */
+function applySpeedConfig(options: PluginOptions): void {
+  const raw = options['barFullScaleTps']
+  const value = typeof raw === 'number' ? raw : Number(raw)
+  if (Number.isFinite(value) && value > 0) {
+    barFullScaleTps = value
+    speedConfigIssue = null
+    return
+  }
+  barFullScaleTps = DEFAULT_BAR_FULL_SCALE_TPS
+  speedConfigIssue = `块条满格基准无效（${String(raw)}），已回退默认 ${DEFAULT_BAR_FULL_SCALE_TPS} t/s`
 }
 
 function emptyAgent(): AgentTotals {
@@ -1710,7 +1735,11 @@ function registerUi(on: On): void {
       // 窄面板块条：序号 2 列 + 间距 + 数值 6 列，其余列给条；按 7px/列保守换算，
       // 宁可条略窄也不让整行越过面板宽度。数值省略 " t/s"，单位已在标题里标明。
       const narrowBarPx = Math.max(40, Math.round((e.props.bodyColumns - 10) * 7))
-      const rowMaxTps = Math.max(1, ...narrowRows.map(tpsOfRound))
+      // 块条满格基准来自 userConfig（默认 300 t/s）：读数按绝对比例点亮，不同轮次、
+      // 不同会话的条长才可比。早前以本轮最大值为满格基准，171 t/s 就顶格，快慢差异
+      // 被压平。峰值超过基准时按实际峰值向上取整到 100 的倍数，避免全部顶格后再次
+      // 失去分辨率。
+      const barFullScale = Math.max(barFullScaleTps, Math.ceil((peak ?? 0) / 100) * 100)
 
       return (
         <Box flexDirection="column" gap={1}>
@@ -1787,7 +1816,7 @@ function registerUi(on: On): void {
                         <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')}</Text>
                       </Box>
                       <SvgTag
-                        source={speedBarRowSvg(tps, rowMaxTps, roundLevel.color, narrowBarPx, 10)}
+                        source={speedBarRowSvg(tps, barFullScale, roundLevel.color, narrowBarPx, 10)}
                         alt={`第 ${index + 1} 轮生成速度 ${tps.toFixed(1)} t/s`}
                         width={narrowBarPx}
                         height={10}
@@ -2371,6 +2400,7 @@ function registerUi(on: On): void {
 export const register: Register = (on, options) => {
   // 延迟分档阈值来自 userConfig；/config 改动会重新加载模块并再次执行这里。
   applyLatencyConfig(options)
+  applySpeedConfig(options)
   registerCollectors(on)
   registerUi(on)
 
@@ -2409,6 +2439,9 @@ export const register: Register = (on, options) => {
     // 阈值配置无效时已回退默认值，这里补一条调试日志便于定位。
     if (latencyConfigIssue) {
       $.ui.log(`usage-toolbar: ${latencyConfigIssue}`, { to: 'debug' })
+    }
+    if (speedConfigIssue) {
+      $.ui.log(`usage-toolbar: ${speedConfigIssue}`, { to: 'debug' })
     }
     void startHistoryLoad($)
     await $.command.register({ name: 'usagebar', description: '打开用量面板' })
