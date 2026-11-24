@@ -1,27 +1,27 @@
 {
   "name": "usage-toolbar",
   "version": "0.2.36",
-  "description": "TPS, session usage, subagent usage and prompt enhancement toolbar for Claude Desktop",
-  "author": { "name": "caixi" },
+  "description": "Claude Desktop 用量与提示词增强：实时生成速度、首字延迟、会话累计、子代理统计、上下文水位与提示词改写。作者：蔡熙贝",
+  "author": { "name": "蔡熙贝" },
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
     "latencyTealMaxSec": {
       "type": "number",
       "title": "延迟青色上限（秒）",
-      "description": "平均首字延迟低于该值为青色（优秀），默认 2",
+      "description": "平均首字延迟（发出请求到首个输出块到达）低于该值为青色。只改变面板「平均延迟」的颜色，不影响数值与统计。默认 2，留空或填非正数按默认值处理。",
       "default": 2
     },
     "latencyGreenMaxSec": {
       "type": "number",
       "title": "延迟绿色上限（秒）",
-      "description": "低于该值为绿色（良好），须大于青色上限，默认 4",
+      "description": "平均延迟不低于青色上限、且低于该值为绿色。须大于青色上限；三项未严格递增时整体回退默认 2/4/8。默认 4。",
       "default": 4
     },
     "latencyYellowMaxSec": {
       "type": "number",
       "title": "延迟黄色上限（秒）",
-      "description": "低于该值为黄色（偏慢），达到或超过为红色告警；须大于绿色上限，默认 8",
+      "description": "平均延迟不低于绿色上限、且低于该值为黄色；达到或超过该值为红色告警。须大于绿色上限。改动在插件重新加载后生效。默认 8。",
       "default": 8
     }
   }
