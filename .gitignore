@@ -4,4 +4,4 @@
 # 依赖与日志
 node_modules/
 *.log
-/docs/ui-prototypes
+/docs/
