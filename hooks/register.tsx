@@ -1926,14 +1926,15 @@ function registerUi(on: On): void {
                   </Box>
                 </Box>
                 {/* 窄侧栏下标签独占一行：内联标签后的折行会从行首开始、与标签错位，
-                    用换行符让正文另起一行，读起来更整齐。 */}
+                    用换行符让正文另起一行，读起来更整齐。正文不截断：记录本身已按
+                    TEXT_LIMIT 限量，由宿主的 Text 折行显示全文。 */}
                 <Text>
                   <Text dimColor>{narrow ? '原文\n' : '原文 '}</Text>
-                  {clip(record.original, Math.max(16, e.props.bodyColumns - (narrow ? 4 : 16)))}
+                  {record.original}
                 </Text>
                 <Text>
                   <Text dimColor>{narrow ? '增强\n' : '增强 '}</Text>
-                  {clip(record.enhanced, Math.max(16, e.props.bodyColumns - (narrow ? 4 : 16)))}
+                  {record.enhanced}
                 </Text>
               </Box>
             ))}
