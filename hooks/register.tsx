@@ -244,6 +244,159 @@ function tpsLevel(tps: number | null): { label: string; color: string } {
   return { label: '≥2000', color: '#7F62D1' }
 }
 
+/**
+ * 把 #rrggbb 转成带透明度的 rgba 字符串，供 SVG 面积层使用。
+ *
+ * <p>SVG 内部无法引用宿主主题变量，颜色只能烘焙成字面量；非十六进制输入
+ * （主题键或颜色名）回退为中性灰，避免面积层退化成纯黑或完全透明。</p>
+ */
+function hexToRgba(hex: string, alpha: number): string {
+  const match = /^#([0-9a-f]{6})$/i.exec(hex)
+  if (!match) return `rgba(127,127,127,${alpha})`
+  const n = parseInt(match[1] ?? '808080', 16)
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`
+}
+
+/** 主题语义色在 SVG 内的兜底色值；SVG 的 fill 只接受具体值，不认主题键名。 */
+const SVG_THEME_HEX: Record<string, string> = {
+  warning: '#C19145',
+  error: '#DF7A68',
+  success: '#3AAC85',
+  text: '#191919',
+  subtle: '#747774',
+}
+
+/**
+ * 把主题键或十六进制色统一成 SVG 可用的十六进制值。
+ *
+ * <p>分档函数在黄色与红色档返回主题键（{@code warning} / {@code error}），
+ * 直接写进 SVG 会被浏览器忽略并回退成黑色；这里按 {@link SVG_THEME_HEX} 映射，
+ * 未知键回退到调用方给的默认色，保证进度条始终有可见填充色。</p>
+ */
+function svgColor(color: string | undefined, fallback: string): string {
+  if (typeof color === 'string' && color.startsWith('#')) return color
+  if (typeof color === 'string') {
+    const mapped = SVG_THEME_HEX[color]
+    if (mapped !== undefined) return mapped
+  }
+  return fallback
+}
+
+/**
+ * 上下文占比水位条：10 个独立圆角方块，按百分比填充前 N 个。
+ *
+ * <p>与设计稿一致的方块阵列：每格 6×8px、间隙 2px、圆角 1.5px，未填充格用浅灰轨色。
+ * 字符水位条（{@code █} / {@code ░}）在桌面端会渲染成受字距影响的小方块与点阵噪声，
+ * 因此桌面端改用 SVG 精确绘制；终端 surface 没有 Svg 元素，仍由字符水位条兜底。</p>
+ */
+function contextBarSvg(percent: number, fill: string): string {
+  const cells = 10
+  const cellWidth = 6
+  const gap = 2
+  const height = 8
+  const radius = 1.5
+  const totalWidth = cells * cellWidth + (cells - 1) * gap
+  const filled = Math.max(0, Math.min(cells, Math.round((percent / 100) * cells)))
+  const parts = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="${height}" viewBox="0 0 ${totalWidth} ${height}">`,
+  ]
+  for (let i = 0; i < cells; i += 1) {
+    parts.push(
+      `<rect x="${i * (cellWidth + gap)}" y="0" width="${cellWidth}" height="${height}" rx="${radius}" fill="${i < filled ? fill : '#CECCCE'}"/>`,
+    )
+  }
+  parts.push('</svg>')
+  return parts.join('')
+}
+
+/**
+ * 生成速度趋势 SVG：折线、半透明面积、三条水平网格线与最新值标注。
+ *
+ * <p>只使用基础图元（line / polyline / path / circle / text），不引入渐变、滤镜
+ * 或脚本，桌面端可以按静态图片光栅化；网格与刻度统一用中性灰，在浅色和深色
+ * 底色上都可读，档位色只用于折线、数据点与最新值。</p>
+ *
+ * <p>数据来源：速度视图最近若干轮的输出速度（时间顺序）；结果作为 {@code Svg}
+ * 的 source 内联绘制。点数少于 2 时返回空串，由调用方降级为字符 sparkline。</p>
+ */
+function speedChartSvg(points: readonly number[], color: string): string {
+  if (points.length < 2) return ''
+  const width = 560
+  const height = 110
+  const left = 36
+  const right = 14
+  const top = 14
+  const bottom = 18
+  const innerW = width - left - right
+  const innerH = height - top - bottom
+  // 纵轴取整到 10 的倍数并留 15% 余量，避免峰值点贴顶。
+  const max = Math.max(10, Math.ceil((Math.max(...points) * 1.15) / 10) * 10)
+  const stepX = innerW / (points.length - 1)
+  const xOf = (index: number) => left + index * stepX
+  const yOf = (value: number) => top + innerH - (Math.max(0, value) / max) * innerH
+  const coords = points.map((value, index) => `${xOf(index).toFixed(1)},${yOf(value).toFixed(1)}`)
+  const baseline = (top + innerH).toFixed(1)
+  const lastX = xOf(points.length - 1)
+  const lastY = yOf(points[points.length - 1] ?? 0)
+  const lastValue = points[points.length - 1] ?? 0
+  const grid = [0, 0.5, 1]
+    .map(ratio => {
+      const gy = top + innerH - ratio * innerH
+      const label = Math.round(max * ratio)
+      return `<line x1="${left}" y1="${gy.toFixed(1)}" x2="${width - right}" y2="${gy.toFixed(1)}" stroke="rgba(127,127,127,0.22)" stroke-width="1" stroke-dasharray="3 4"/><text x="${left - 6}" y="${(gy + 3).toFixed(1)}" text-anchor="end" font-family="monospace" font-size="9" fill="#8A8F98">${label}</text>`
+    })
+    .join('')
+  const areaPath = `M${left},${baseline} ${coords.map(coord => `L${coord}`).join(' ')} L${lastX.toFixed(1)},${baseline} Z`
+  const dots = points
+    .map((value, index) => `<circle cx="${xOf(index).toFixed(1)}" cy="${yOf(value).toFixed(1)}" r="2" fill="${color}"/>`)
+    .join('')
+  const labelX = Math.min(width - right, lastX + 8)
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">${grid}<path d="${areaPath}" fill="${hexToRgba(color, 0.16)}"/><polyline points="${coords.join(' ')}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>${dots}<circle cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(1)}" r="4" fill="${color}" stroke="${hexToRgba(color, 0.3)}" stroke-width="5"/><text x="${labelX.toFixed(1)}" y="${(lastY - 8).toFixed(1)}" text-anchor="end" font-family="monospace" font-size="10" fill="${color}">${lastValue.toFixed(1)}</text></svg>`
+}
+
+/**
+ * 生成轮次柱状图 SVG：每轮一根柱，柱顶标速度、底部标轮次序号、左侧标速度刻度。
+ *
+ * <p>柱宽按轮次数均分可用宽度，12 轮时单根约 25px，柱顶数值用 8px 等宽字体，
+ * 与相邻柱不重叠；柱色由调用方按该轮档位传入，和折线图、指标卡保持同一套颜色语义。
+ * 无数据时返回空串，由调用方退回字符条形图。</p>
+ */
+function speedBarsSvg(values: readonly number[], colors: readonly string[]): string {
+  if (values.length === 0) return ''
+  const width = 560
+  const height = 160
+  const left = 36
+  const right = 12
+  const top = 18
+  const bottom = 24
+  const innerW = width - left - right
+  const innerH = height - top - bottom
+  // 纵轴留 20% 余量，柱顶数值不会被裁掉。
+  const max = Math.max(10, Math.ceil((Math.max(...values) * 1.2) / 10) * 10)
+  const slot = innerW / values.length
+  const barW = Math.max(6, Math.min(32, slot * 0.66))
+  const baseline = top + innerH
+  const grid = [0, 0.5, 1]
+    .map(ratio => {
+      const gy = baseline - ratio * innerH
+      const label = Math.round(max * ratio)
+      return `<line x1="${left}" y1="${gy.toFixed(1)}" x2="${width - right}" y2="${gy.toFixed(1)}" stroke="rgba(127,127,127,0.22)" stroke-width="1" stroke-dasharray="3 4"/><text x="${left - 6}" y="${(gy + 3).toFixed(1)}" text-anchor="end" font-family="monospace" font-size="9" fill="#8A8F98">${label}</text>`
+    })
+    .join('')
+  const bars = values
+    .map((value, index) => {
+      const x = left + index * slot + (slot - barW) / 2
+      const barHeight = Math.max(1, (Math.max(0, value) / max) * innerH)
+      const y = baseline - barHeight
+      const labelY = Math.max(top + 9, y - 4)
+      const centerX = x + barW / 2
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="2" fill="${colors[index] ?? '#3AAC85'}"/><text x="${centerX.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle" font-family="monospace" font-size="9" fill="#8A8F98">${value.toFixed(1)}</text><text x="${centerX.toFixed(1)}" y="${(height - 6).toFixed(1)}" text-anchor="middle" font-family="monospace" font-size="9" fill="#8A8F98">${index + 1}</text>`
+    })
+    .join('')
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">${grid}${bars}</svg>`
+}
 
 /** 把工作中耗时格式化为「X 分 X 秒」。 */
 function formatElapsed(ms: number): string {
@@ -360,7 +513,15 @@ function applyLatencyConfig(options: PluginOptions): void {
 }
 
 function emptyAgent(): AgentTotals {
-  return { requests: 0, turns: 0, genMs: 0, outputTokens: 0 }
+  return {
+    requests: 0,
+    turns: 0,
+    genMs: 0,
+    outputTokens: 0,
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+  }
 }
 
 /** 主循环请求计数：requests 加一，并按模型累计请求数。 */
@@ -566,6 +727,18 @@ function registerCollectors(on: On): void {
             }
           }
 
+          // 子代理每个请求结束就把本轮上报的模型写入累计，不必等 turn.complete：
+          // 中断的轮次也能显示模型，代理页「未知模型」的窗口从整轮缩短到首个请求。
+          if (e.agentId !== undefined && chunk.usage?.model) {
+            const agentId = e.agentId
+            const model = chunk.usage.model
+            await update($, agentTotals, maps => {
+              const prev = maps[agentId] ?? emptyAgent()
+              if (prev.model === model) return maps
+              return { ...maps, [agentId]: { ...prev, model } }
+            })
+          }
+
           // 每次响应结束后重读宿主读数：压缩后新窗口的第一次响应一回来，上下文占比即可用，
           // 不必等到整轮结束才恢复状态行；子代理请求不改变主会话窗口，跳过。
           if (e.agentId === undefined) {
@@ -636,6 +809,9 @@ function registerCollectors(on: On): void {
         $.ui.invalidate('ui.render')
       } else {
         const agentId = e.agentId
+        // 子代理按 agentId 独立累计：输入与缓存字段来自本轮的宿主 usage，
+        // 旧快照没有这些字段时按 0 相加，避免 undefined 参与运算产生 NaN；
+        // 模型记录本轮实际应答的模型，宿主未报模型时保留上一次的值。
         await update($, agentTotals, maps => {
           const prev = maps[agentId] ?? emptyAgent()
           return {
@@ -645,6 +821,10 @@ function registerCollectors(on: On): void {
               turns: prev.turns + 1,
               genMs: prev.genMs + round.genMs,
               outputTokens: prev.outputTokens + round.outputTokens,
+              inputTokens: (prev.inputTokens ?? 0) + round.inputTokens,
+              cacheReadTokens: (prev.cacheReadTokens ?? 0) + round.cacheReadTokens,
+              cacheCreationTokens: (prev.cacheCreationTokens ?? 0) + round.cacheCreationTokens,
+              model: round.model === 'unknown' ? prev.model : round.model,
             },
           }
         })
@@ -1307,6 +1487,9 @@ function registerUi(on: On): void {
   // 用量面板：四个视图共用一份会话数据，切换只改变当前视图。
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
+    // Svg 只存在于非终端 surface 的元素表；终端表没有该键，按 surface 收窄后再取，
+    // 终端绘制时保持 null，由字符条形图承担趋势展示。
+    const SvgTag = e.surface === 'terminal' ? null : $.ui.resolve(e).Svg
     const current = await read($, view)
     const confirmingReset = await read($, resetConfirming)
     const confirmingClear = await read($, clearConfirming)
@@ -1354,16 +1537,55 @@ function registerUi(on: On): void {
       />
     )
 
-    // 指标卡：标题在上、数值在下；按面板可用列数每行放 4 个，避免右侧被裁。
-    const cardWidth = Math.max(10, Math.floor((e.props.bodyColumns - 2) / 4))
-    const metric = (label: string, value: string, color?: string) => (
-      <Box flexDirection="column" width={cardWidth}>
-        <Text dimColor>{label}</Text>
-        <Text weight="semibold" color={color}>{value}</Text>
+    /**
+     * 键值行：标签靠左、数值靠右，同一列内形成一条右对齐的数值边。
+     *
+     * <p>与「标签在上、数值在下」的卡片式指标相比，右对齐让不同位数的读数可以按末位
+     * 纵向比较；会话视图的 Token 构成与请求与性能两组都使用这种行式布局。</p>
+     */
+    const kvRow = (label: string, value: string, color?: string) => (
+      <Box flexDirection="row" justifyContent="space-between" gap={1}>
+        <Text dimColor size="caption">{label}</Text>
+        <Text color={color}>{value}</Text>
       </Box>
     )
 
-    // 生成速度视图：最近轮次平均、峰值/最低/最新与字符柱状图；按速度档位着色。
+    // 代理视图的网格指标卡：标题在上、数值在下，列数随面板宽度自适应；
+    // 会话视图已改用右对齐的 kvRow，两者按各视图的读数数量分别使用。
+    const gridColumns = e.props.bodyColumns >= 56 ? 5 : e.props.bodyColumns >= 36 ? 4 : 2
+    const cardWidth = Math.max(8, Math.floor((e.props.bodyColumns - (gridColumns - 1)) / gridColumns))
+    const metric = (label: string, value: string, color?: string) => (
+      <Box flexDirection="column" width={cardWidth}>
+        <Text dimColor size="caption">{label}</Text>
+        <Text color={color}>{value}</Text>
+      </Box>
+    )
+
+    /**
+     * 水位条：按百分比把 10 格方块填满，未填充部分用 dim 的浅块占位。
+     *
+     * <p>用于上下文占比与缓存率这类「当前水平」指标；颜色沿用对应分档色，
+     * 无读数时由调用方传 0 并单独显示「—」，不在这里分支。</p>
+     */
+    const waterBar = (percent: number, color?: string) => {
+      const filled = Math.max(0, Math.min(10, Math.round(percent / 10)))
+      return (
+        <Text color={color}>
+          {'█'.repeat(filled)}
+          <Text dimColor>{'░'.repeat(10 - filled)}</Text>
+        </Text>
+      )
+    }
+
+    /** 行内小指标：标签 dim、数值同行常规字重，用于峰值/最低/最新这类次要读数。 */
+    const compactMetric = (label: string, value: string, color?: string) => (
+      <Box flexDirection="row" gap={1}>
+        <Text dimColor size="caption">{label}</Text>
+        <Text color={color}>{value}</Text>
+      </Box>
+    )
+
+    // 生成速度视图：平均速度、档位、峰值/最低/最新与按面板宽度铺开的轮次条。
     const speedView = () => {
       const recent = list.slice(-18)
       const totalOut = recent.reduce((n, r) => n + r.outputTokens, 0)
@@ -1378,55 +1600,98 @@ function registerUi(on: On): void {
       const model = latestRound
         ? clip(modelLabel(latestRound.model), Math.max(10, e.props.bodyColumns - 30))
         : '—'
+      const rows = recent.slice(-12)
       const maxTps = peak ?? 1
-      const scope = '当前会话'
+      // 条形区按面板可用列数分配，并给编号和数值留固定列，保证纵向扫读时数字对齐。
+      const barMax = Math.max(6, e.props.bodyColumns - 20)
+      // 折线画在条形图上方：只用基础 SVG 图元，面板足够宽且至少 2 轮时才绘制，
+      // 窄侧栏或终端退回条形图，不出现半截图。
+      const trend = rows.map(tpsOfRound)
+      const showChart = e.surface !== 'terminal' && e.props.bodyColumns >= 64 && trend.length >= 2
+      const chartSvg = showChart ? speedChartSvg(trend, level.color) : ''
+      const barColors = rows.map(round => tpsLevel(tpsOfRound(round)).color)
+      const barsSvg = showChart ? speedBarsSvg(trend, barColors) : ''
 
       return (
-        <Box flexDirection="column" rowGap={1}>
-          <Text dimColor>{scope} · 最近 {recent.length} 轮平均输出速度</Text>
-          <Text color={level.color} weight="bold" size="heading">
-            {avg === null ? '—' : avg.toFixed(1)} <Text>t/s</Text>
-          </Text>
-          <Box flexDirection="row">
-            <Text color={level.color}>{level.label}</Text>
-            <Text dimColor> · {model}</Text>
+        <Box flexDirection="column" gap={1}>
+          <Text dimColor size="caption">当前会话 · 最近 {recent.length} 轮平均输出速度</Text>
+          {/* 主数值独占一行，单位用小字；档位与模型另起一行，避免挤在一起。 */}
+          <Box flexDirection="row" alignItems="flex-end" gap={1}>
+            <Text color={level.color} size="heading">
+              {avg === null ? '—' : avg.toFixed(1)}
+            </Text>
+            <Text dimColor size="caption">t/s</Text>
+            <Text color={level.color} size="caption">{level.label}</Text>
+            <Text dimColor size="caption">· {model}</Text>
           </Box>
-          <Box flexDirection="row">
-            {metric('峰值', peak === null ? '—' : peak.toFixed(1), tpsLevel(peak).color)}
-            {metric('最低', low === null ? '—' : low.toFixed(1), tpsLevel(low).color)}
-            {metric('最新', latest === null ? '—' : latest.toFixed(1), tpsLevel(latest).color)}
+          {/* 趋势折线：网格与刻度中性灰，折线与面积用当前档位色；无数据时不绘制。 */}
+          {chartSvg !== '' && SvgTag !== null && (
+            <SvgTag
+              source={chartSvg}
+              alt={`最近 ${trend.length} 轮生成速度趋势，最新 ${latest === null ? '—' : latest.toFixed(1)} t/s`}
+              width={540}
+              height={106}
+            />
+          )}
+          {/* 峰值/最低/最新并列一行；「最低」是统计量，保持中性色，避免被误读成告警。 */}
+          <Box flexDirection="row" gap={2}>
+            {compactMetric('峰值', peak === null ? '—' : peak.toFixed(1), tpsLevel(peak).color)}
+            {compactMetric('最低', low === null ? '—' : low.toFixed(1))}
+            {compactMetric('最新', latest === null ? '—' : latest.toFixed(1), tpsLevel(latest).color)}
           </Box>
-          <Text dimColor>最近 {Math.min(12, recent.length)} 轮生成速度</Text>
-          {recent.length === 0 && <Text dimColor>还没有完成的轮次</Text>}
-          {recent.slice(-12).map((round, index) => {
-            const tps = tpsOfRound(round)
-            const roundLevel = tpsLevel(tps)
-            const width = Math.max(1, Math.round((tps / maxTps) * 10))
-            return (
-              <Box key={round.turnId} flexDirection="row">
-                <Text dimColor>{String(index + 1).padStart(2, ' ')} </Text>
-                <Text color={roundLevel.color}>{'█'.repeat(width)}</Text>
-                <Text color={roundLevel.color}> {tps.toFixed(1)} t/s</Text>
-              </Box>
-            )
-          })}
+          {rows.length === 0 ? (
+            <Text dimColor size="caption">还没有完成的轮次</Text>
+          ) : barsSvg !== '' && SvgTag !== null ? (
+            // 宽面板用柱状图：柱顶有数值、底部有轮次序号、左侧有刻度，比字符条更易读。
+            <Box flexDirection="column" gap={1}>
+              <Text size="caption" weight="bold">最近 {rows.length} 轮生成速度（t/s）</Text>
+              <SvgTag
+                source={barsSvg}
+                alt={`最近 ${rows.length} 轮生成速度柱状图，峰值 ${peak === null ? '—' : peak.toFixed(1)} t/s`}
+                width={540}
+                height={155}
+              />
+            </Box>
+          ) : (
+            // 终端或窄侧栏退回字符条：保证每轮都有可读的数值。
+            <Box flexDirection="column">
+              <Text dimColor size="caption">最近 {rows.length} 轮生成速度</Text>
+              {rows.map((round, index) => {
+                const tps = tpsOfRound(round)
+                const roundLevel = tpsLevel(tps)
+                const width = Math.max(1, Math.round((tps / maxTps) * barMax))
+                return (
+                  <Box key={round.turnId} flexDirection="row">
+                    <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')} </Text>
+                    <Box width={barMax}>
+                      <Text color={roundLevel.color}>{'█'.repeat(width)}</Text>
+                    </Box>
+                    <Text color={roundLevel.color}> {tps.toFixed(1)} t/s</Text>
+                  </Box>
+                )
+              })}
+            </Box>
+          )}
         </Box>
       )
     }
 
     // 增强记录视图：只展示当前会话的记录，卡片列出原文、增强文、token 与耗时。
     const enhanceView = () => {
+      // 窄侧栏下卡片首行的模型名与元信息会互相挤压、各自折行导致错位，
+      // 改为上下排列；宽面板仍保持左名右数字的一行式。
+      const narrow = e.props.bodyColumns < 48
       // 旧版本记录没有 sessionId，不属于任何会话；读不到会话 id 时同样不展示。
       const records = currentSessionId
         ? allRecords.filter(record => record.sessionId === currentSessionId)
         : []
 
       return (
-        <Box flexDirection="column" rowGap={1}>
+        <Box flexDirection="column" gap={1}>
           {/* 行宽显式取面板可用列数，再用弹性占位把按钮推到最右：Pane 内的 Box 宽度随内容收缩，
               只写 justifyContent 时没有剩余空间可分布。 */}
           <Box flexDirection="row" width={e.props.bodyColumns}>
-            <Text dimColor>最近增强记录 {records.length} 条</Text>
+            <Text dimColor size="caption">最近增强记录 {records.length} 条</Text>
             <Box flexGrow={1} />
             <Button
               key="clear-records"
@@ -1440,16 +1705,23 @@ function registerUi(on: On): void {
               }}
             />
           </Box>
-          {/* 与重置告警同一形态：红色边框 + 红色标题说明范围，确认放在面板内部，
-              不写入会话。 */}
-          <Box flexDirection="column" borderStyle="round" borderColor="error" paddingX={1}>
-            <Text weight="semibold" color="error">⚠ 危险操作 · 清空当前会话的增强记录</Text>
-            <Text>删除当前会话的全部增强记录，且无法恢复。</Text>
-            <Text dimColor>其他会话的记录不受影响。</Text>
+          {/* 与重置告警同一形态：左侧红色竖条 + 红色标题说明范围，正文保持默认色，
+              确认放在面板内部，不写入会话。 */}
+          {/* 左侧竖条用 Box 背景色绘制：块字符受行距影响会断成三段，背景色块可以连续铺满，
+              alignSelf="stretch" 让它与右侧文字块等高；字符保留作背景色不可用时的兜底。 */}
+          <Box flexDirection="row" gap={1} alignItems="stretch">
+            <Box width={1} backgroundColor="error">
+              <Text color="error">{'▌\n▌\n▌'}</Text>
+            </Box>
+            <Box flexDirection="column">
+              <Text weight="bold" color="error">清空当前会话的增强记录</Text>
+              <Text>删除当前会话的全部增强记录，且无法恢复。</Text>
+              <Text dimColor>其他会话的记录不受影响。</Text>
+            </Box>
           </Box>
           {confirmingClear && (
             <Box flexDirection="column">
-              <Text weight="semibold">确认清空？此操作无法恢复。</Text>
+              <Text weight="bold">确认清空？此操作无法恢复。</Text>
               <Box flexDirection="row" width={e.props.bodyColumns} gap={1}>
                 <Box flexGrow={1} />
                 <Button
@@ -1477,19 +1749,37 @@ function registerUi(on: On): void {
             </Box>
           )}
           {records.length === 0 && (
-            <Text dimColor>还没有增强记录。点击输入框上方的「✦ 增强」或执行 /enhance。</Text>
+            <Text dimColor size="caption">还没有增强记录。点击输入框上方的「✦ 增强」或执行 /enhance。</Text>
           )}
-          {records.slice(0, 8).map(record => (
-            <Box key={record.id} flexDirection="column" borderStyle="round" paddingX={1}>
-              <Text dimColor>模型 {modelLabel(record.model)}</Text>
-              <Text>原文：{clip(record.original, Math.max(20, e.props.bodyColumns - 16))}</Text>
-              <Text>增强：{clip(record.enhanced, Math.max(20, e.props.bodyColumns - 16))}</Text>
-              <Text dimColor>
-                消耗 {record.inputTokens}/{record.outputTokens} token · {formatTime(record.at)} ·{' '}
-                {Math.round(record.durationMs)}ms
-              </Text>
-            </Box>
-          ))}
+          {/* 记录卡片：首行放模型与消耗元信息，正文两行带 dim 标签；
+              卡片之间与代理页一致，用 gap 留一行间隔。 */}
+          <Box flexDirection="column" gap={1}>
+            {records.slice(0, 8).map(record => (
+              <Box key={record.id} flexDirection="column" borderStyle="round" borderColor="#C8C8C8" paddingX={1}>
+                <Box flexDirection={narrow ? 'column' : 'row'} gap={1}>
+                  <Text dimColor size="caption">{modelLabel(record.model)}</Text>
+                  {!narrow && <Box flexGrow={1} />}
+                  <Box flexDirection="row" gap={1} flexWrap="wrap">
+                    <Text dimColor size="caption">
+                      {record.inputTokens}/{record.outputTokens} tok
+                    </Text>
+                    <Text dimColor size="caption">{Math.round(record.durationMs)}ms</Text>
+                    <Text dimColor size="caption">{formatTime(record.at)}</Text>
+                  </Box>
+                </Box>
+                {/* 窄侧栏下标签独占一行：内联标签后的折行会从行首开始、与标签错位，
+                    用换行符让正文另起一行，读起来更整齐。 */}
+                <Text>
+                  <Text dimColor>{narrow ? '原文\n' : '原文 '}</Text>
+                  {clip(record.original, Math.max(16, e.props.bodyColumns - (narrow ? 4 : 16)))}
+                </Text>
+                <Text>
+                  <Text dimColor>{narrow ? '增强\n' : '增强 '}</Text>
+                  {clip(record.enhanced, Math.max(16, e.props.bodyColumns - (narrow ? 4 : 16)))}
+                </Text>
+              </Box>
+            ))}
+          </Box>
         </Box>
       )
     }
@@ -1505,79 +1795,161 @@ function registerUi(on: On): void {
       const cacheRate = cacheRateOf(display.inputTokens, display.cacheReadTokens, display.cacheCreationTokens)
       const cost = usage?.cost?.usd ?? null
       const contextPercent = usage?.context.percent ?? null
-      // 模型明细列宽：30 列窄侧栏下模型名保留 9 列，Token/请求/缓存率共用其余宽度。
+      // 模型明细列宽：卡片占 4 列（边框 2 + paddingX 2）、三处列间距占 3 列；
+      // 30 列窄侧栏下模型名保留 9 列，其余宽度由输出/请求/缓存率共用。
       const tokenWidth = 8
       const requestWidth = 4
       const cacheWidth = 6
-      const modelWidth = Math.max(9, e.props.bodyColumns - tokenWidth - requestWidth - cacheWidth - 4)
-      const scope = '当前会话累计'
+      const modelWidth = Math.max(9, e.props.bodyColumns - tokenWidth - requestWidth - cacheWidth - 8)
+      const contextLevel = tierColor(contextPercent, CONTEXT_BOUNDS_PERCENT)
+      // 三卡并排时每卡内容宽约 (列数 - 2) / 3 - 4（边框与 paddingX 各占 2 列）；
+      // 卡 1 第三行最长约 16 列（三位数请求数 + 两位数轮数），因此低于 64 列改为纵向堆叠，
+      // 避免该行折行把卡片撑高、破坏三卡等高。
+      const summaryRow = e.props.bodyColumns >= 64
+      // 键值两列需要每列至少约 24 列；更窄时回落单列，保证标签与数值同行可读。
+      const kvColumns = e.props.bodyColumns >= 48
 
       return (
-        <Box flexDirection="column">
-          <Text dimColor>{scope}</Text>
-          <Box flexDirection="row" flexWrap="wrap" rowGap={1}>
-            {metric('总用量', fmtTokens(total))}
-            {metric('输入', fmtTokens(display.inputTokens))}
-            {metric('输出', fmtTokens(display.outputTokens))}
-            {metric('缓存读取', fmtTokens(display.cacheReadTokens))}
-            {metric('缓存写入', fmtTokens(display.cacheCreationTokens))}
-            {metric('缓存率', cacheRate === null ? '—' : `${cacheRate.toFixed(1)}%`, cacheRateLevel(cacheRate))}
-            {metric('请求次数', String(display.requests))}
-            {metric('轮数', String(display.turns))}
-            {metric('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—', tierColor(display.turns > 0 ? avgDuration : null, DURATION_BOUNDS_MS))}
-            {metric('平均延迟', display.ttftCount > 0 ? `${(avgTtft / 1000).toFixed(1)}s` : '—', latencyColor(display.ttftCount > 0 ? avgTtft : null))}
-            {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, tpsLevel(avgTps).color)}
-            {metric('估算费用', cost === null ? '不可得' : `$${cost.toFixed(2)}`)}
-            {metric('上下文', contextPercent === null ? '—' : `${contextPercent}%`, tierColor(contextPercent, CONTEXT_BOUNDS_PERCENT))}
+        // 整个视图统一用 gap 控制纵向间距，不再插入空 `<Text>` 行：
+        // 空行的实际高度是行高，比 gap 的字符格更大，混用会导致间距不一致。
+        <Box flexDirection="column" gap={1}>
+          {/* 摘要：三张圆角卡承载核心读数，用块级边界替代空白堆叠；上下文卡内嵌 10 格水位条，
+              百分比用大数值，水位条只做余量提示。 */}
+          <Box flexDirection={summaryRow ? 'row' : 'column'} gap={1}>
+            <Box flexDirection="column" flexGrow={1} borderStyle="round" borderColor="#C8C8C8" paddingX={1} paddingY={1}>
+              <Text dimColor size="caption" weight="bold">当前会话累计</Text>
+              <Text size="heading">{fmtTokens(total)}</Text>
+              <Text dimColor size="caption">{display.requests} 请求 · {display.turns} 轮</Text>
+            </Box>
+            <Box flexDirection="column" flexGrow={1} borderStyle="round" borderColor="#C8C8C8" paddingX={1} paddingY={1}>
+              <Text dimColor size="caption" weight="bold">估算费用</Text>
+              <Text size="heading">{cost === null ? '不可得' : `$${cost.toFixed(2)}`}</Text>
+              <Text dimColor size="caption">本地估算</Text>
+            </Box>
+            <Box flexDirection="column" flexGrow={1} borderStyle="round" borderColor="#C8C8C8" paddingX={1} paddingY={1}>
+              <Text dimColor size="caption" weight="bold">上下文</Text>
+              <Text size="heading" color={contextLevel}>
+                {contextPercent === null ? '—' : `${contextPercent}%`}
+              </Text>
+              {/* 桌面端用 SVG 画连续圆角进度条；终端没有 Svg 元素，退回字符水位条。 */}
+              {SvgTag !== null ? (
+                <SvgTag
+                  source={contextBarSvg(contextPercent ?? 0, svgColor(contextLevel, '#2C8F87'))}
+                  alt={`上下文占比 ${contextPercent === null ? '无读数' : `${contextPercent}%`}`}
+                  width={78}
+                  height={8}
+                />
+              ) : (
+                waterBar(contextPercent ?? 0, contextLevel)
+              )}
+            </Box>
           </Box>
-          {/* 与上方指标卡拉开一行，避免两个区块黏在一起。 */}
-          <Text>{' '}</Text>
-          <Text dimColor>模型明细</Text>
-          <Box flexDirection="row" gap={1}>
-            <Box width={modelWidth}><Text dimColor>模型</Text></Box>
-            <Box width={tokenWidth} justifyContent="center"><Text dimColor>Token</Text></Box>
-            <Box width={requestWidth} justifyContent="center"><Text dimColor>请求</Text></Box>
-            <Box width={cacheWidth} justifyContent="center"><Text dimColor>缓存率</Text></Box>
-          </Box>
-          {Object.entries(display.byModel).length === 0 && <Text dimColor>还没有模型用量</Text>}
-          {Object.entries(display.byModel).map(([model, modelTotals]) => {
-            // 旧快照可能没有按模型的缓存字段，按 0 处理；无输入侧时显示「—」。
-            const rate = cacheRateOf(
-              modelTotals.inputTokens,
-              modelTotals.cacheReadTokens ?? 0,
-              modelTotals.cacheCreationTokens ?? 0,
-            )
-            return (
-              <Box key={model} flexDirection="row" gap={1}>
-                <Box width={modelWidth}><Text>{clip(modelLabel(model), modelWidth)}</Text></Box>
-                <Box width={tokenWidth} justifyContent="center">
-                  <Text>{fmtTokens(modelTotals.outputTokens)}</Text>
+          {/* 指标按语义分两组，每组一张圆角卡，与顶部摘要卡同一视觉层级；
+              组内为两列键值行，窄侧栏回落单列；摘要三卡与明细卡、明细卡之间
+              都留一行间隔，与速度、增强、代理三个页签的卡片间距一致。 */}
+          <Box flexDirection="column" gap={1}>
+            <Box flexDirection="column" borderStyle="round" borderColor="#C8C8C8" paddingX={1} paddingY={1}>
+              <Text size="caption" weight="bold">Token 构成</Text>
+              {kvColumns ? (
+                <Box flexDirection="row" gap={4}>
+                  <Box flexDirection="column" flexGrow={1}>
+                    {kvRow('输入', fmtTokens(display.inputTokens))}
+                    {kvRow('输出', fmtTokens(display.outputTokens))}
+                    {kvRow('缓存率', cacheRate === null ? '—' : `${cacheRate.toFixed(1)}%`, cacheRateLevel(cacheRate))}
+                  </Box>
+                  <Box flexDirection="column" flexGrow={1}>
+                    {kvRow('缓存读取', fmtTokens(display.cacheReadTokens))}
+                    {kvRow('缓存写入', fmtTokens(display.cacheCreationTokens))}
+                  </Box>
                 </Box>
-                <Box width={requestWidth} justifyContent="center">
-                  <Text>{String(modelTotals.requests)}</Text>
+              ) : (
+                <Box flexDirection="column">
+                  {kvRow('输入', fmtTokens(display.inputTokens))}
+                  {kvRow('输出', fmtTokens(display.outputTokens))}
+                  {kvRow('缓存读取', fmtTokens(display.cacheReadTokens))}
+                  {kvRow('缓存写入', fmtTokens(display.cacheCreationTokens))}
+                  {kvRow('缓存率', cacheRate === null ? '—' : `${cacheRate.toFixed(1)}%`, cacheRateLevel(cacheRate))}
                 </Box>
-                <Box width={cacheWidth} justifyContent="center">
-                  <Text color={cacheRateLevel(rate)}>
-                    {rate === null ? '—' : `${rate.toFixed(1)}%`}
-                  </Text>
+              )}
+            </Box>
+            <Box flexDirection="column" borderStyle="round" borderColor="#C8C8C8" paddingX={1} paddingY={1}>
+              <Text size="caption" weight="bold">请求与性能</Text>
+              {kvColumns ? (
+                <Box flexDirection="row" gap={4}>
+                  <Box flexDirection="column" flexGrow={1}>
+                    {kvRow('请求次数', String(display.requests))}
+                    {kvRow('轮数', String(display.turns))}
+                    {kvRow('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, tpsLevel(avgTps).color)}
+                  </Box>
+                  <Box flexDirection="column" flexGrow={1}>
+                    {kvRow('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—', tierColor(display.turns > 0 ? avgDuration : null, DURATION_BOUNDS_MS))}
+                    {kvRow('平均延迟', display.ttftCount > 0 ? `${(avgTtft / 1000).toFixed(1)}s` : '—', latencyColor(display.ttftCount > 0 ? avgTtft : null))}
+                  </Box>
                 </Box>
+              ) : (
+                <Box flexDirection="column">
+                  {kvRow('请求次数', String(display.requests))}
+                  {kvRow('轮数', String(display.turns))}
+                  {kvRow('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—', tierColor(display.turns > 0 ? avgDuration : null, DURATION_BOUNDS_MS))}
+                  {kvRow('平均延迟', display.ttftCount > 0 ? `${(avgTtft / 1000).toFixed(1)}s` : '—', latencyColor(display.ttftCount > 0 ? avgTtft : null))}
+                  {kvRow('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, tpsLevel(avgTps).color)}
+                </Box>
+              )}
+            </Box>
+            {/* 模型明细：标题与列头合并成一行，整块包在圆角卡内，与上面两组同层级。 */}
+            <Box flexDirection="column" borderStyle="round" borderColor="#C8C8C8" paddingX={1} paddingY={1}>
+              <Box flexDirection="row" gap={1}>
+                <Box width={modelWidth}><Text size="caption" weight="bold">模型明细</Text></Box>
+                <Box width={tokenWidth} justifyContent="flex-end"><Text dimColor size="caption" weight="bold">输出</Text></Box>
+                <Box width={requestWidth} justifyContent="flex-end"><Text dimColor size="caption" weight="bold">请求</Text></Box>
+                <Box width={cacheWidth} justifyContent="flex-end"><Text dimColor size="caption" weight="bold">缓存率</Text></Box>
               </Box>
-            )
-          })}
-          <Text dimColor>费用为宿主 /cost 的本地估算，不是账单。</Text>
-          <Text>{' '}</Text>
-          {/* 桌面端原生 Button 不呈现子 Text 的颜色（运行时截图确认），风险不能只靠颜色传达：
-              边框告警块常驻说明清空范围与不可恢复性；确认放在面板内部，不调用会写入会话的
-              AskUserQuestion 卡片。 */}
-          <Box flexDirection="column" borderStyle="round" borderColor="error" paddingX={1}>
-            <Text weight="semibold" color="error">⚠ 危险操作 · 重置当前会话统计</Text>
-            <Text>清空本会话的轮次与累计，并删除数据库中该会话的记录。</Text>
-            <Text dimColor>删除后无法恢复；其他会话的数据不受影响。</Text>
+              {Object.entries(display.byModel).length === 0 && <Text dimColor size="caption">还没有模型用量</Text>}
+              {Object.entries(display.byModel).map(([model, modelTotals]) => {
+                // 旧快照可能没有按模型的缓存字段，按 0 处理；无输入侧时显示「—」。
+                const rate = cacheRateOf(
+                  modelTotals.inputTokens,
+                  modelTotals.cacheReadTokens ?? 0,
+                  modelTotals.cacheCreationTokens ?? 0,
+                )
+                return (
+                  <Box key={model} flexDirection="row" gap={1}>
+                    <Box width={modelWidth}><Text>{clip(modelLabel(model), modelWidth)}</Text></Box>
+                    <Box width={tokenWidth} justifyContent="flex-end">
+                      <Text>{fmtTokens(modelTotals.outputTokens)}</Text>
+                    </Box>
+                    <Box width={requestWidth} justifyContent="flex-end">
+                      <Text>{String(modelTotals.requests)}</Text>
+                    </Box>
+                    <Box width={cacheWidth} justifyContent="flex-end">
+                      <Text color={cacheRateLevel(rate)}>
+                        {rate === null ? '—' : `${rate.toFixed(1)}%`}
+                      </Text>
+                    </Box>
+                  </Box>
+                )
+              })}
+            </Box>
           </Box>
-          <Text>{' '}</Text>
+          {/* 脚注由外层 gap 与表格分隔，不再单独插空行。 */}
+          <Text dimColor size="caption">费用为宿主 /cost 的本地估算，不是账单。</Text>
+          {/* 桌面端原生 Button 不呈现子 Text 的颜色（运行时截图确认），风险不能只靠颜色传达：
+              左侧红色竖条 + 红色标题常驻说明清空范围与不可恢复性，正文保持默认色，既保留告警
+              语义，又不与上方数据抢视觉；确认放在面板内部，不调用会写入会话的 AskUserQuestion 卡片。 */}
+          {/* 与增强视图的清空告警同一形态：背景色块竖条 + 拉伸等高，避免字符行距造成断线。 */}
+          <Box flexDirection="row" gap={1} alignItems="stretch">
+            <Box width={1} backgroundColor="error">
+              <Text color="error">{'▌\n▌\n▌'}</Text>
+            </Box>
+            <Box flexDirection="column">
+              <Text weight="bold" color="error">重置当前会话统计</Text>
+              <Text>清空本会话的轮次与累计，并删除数据库中该会话的记录。</Text>
+              <Text dimColor>删除后无法恢复；其他会话的数据不受影响。</Text>
+            </Box>
+          </Box>
           {confirmingReset ? (
             <Box flexDirection="column">
-              <Text weight="semibold">确认重置？此操作无法恢复。</Text>
+              <Text weight="bold">确认重置？此操作无法恢复。</Text>
               <Box flexDirection="row" width={e.props.bodyColumns} gap={1}>
                 <Box flexGrow={1} />
                 <Button
@@ -1617,91 +1989,197 @@ function registerUi(on: On): void {
 
     // 子代理视图：独立统计，明确标注不计入会话累计。
     // 宿主名单（$.agent.list）不收录工作流子代理与引擎内部循环，但它们的 turn 事件带
-    // agentId，已被 agentTotals 按 id 计数；名单之外的条目单独聚合成一行，不把未知 id
-    // 伪装成有名称、模型的具体代理。
+    // agentId，已被 agentTotals 按 id 计数；名单之外的条目单独聚合，模型只记录
+    // 最近一次响应上报的模型 id，不把它伪装成有名称、有状态的具体代理。
     const agentsView = () => {
+      // 窄侧栏下长文本会按字符折行，标题与指标字段需要拆成可换行的独立文本块。
+      const narrow = e.props.bodyColumns < 48
       const listedIds = new Set(agents.map(agent => agent.id))
-      const unlisted = Object.entries(maps).filter(([id]) => !listedIds.has(id))
+      // 按请求数降序，活跃的循环排在前面；请求数相同则保持插入顺序。
+      const unlisted = Object.entries(maps)
+        .filter(([id]) => !listedIds.has(id))
+        .sort(([, a], [, b]) => b.requests - a.requests)
+      // 名单外循环的汇总：输入与缓存字段在旧快照里可能缺省，按 0 相加保证缓存率不发散。
       const unlistedTotals = unlisted.reduce(
         (acc, [, counted]) => ({
           requests: acc.requests + counted.requests,
           turns: acc.turns + counted.turns,
           outputTokens: acc.outputTokens + counted.outputTokens,
           genMs: acc.genMs + counted.genMs,
+          inputTokens: acc.inputTokens + (counted.inputTokens ?? 0),
+          cacheReadTokens: acc.cacheReadTokens + (counted.cacheReadTokens ?? 0),
+          cacheCreationTokens: acc.cacheCreationTokens + (counted.cacheCreationTokens ?? 0),
         }),
-        { requests: 0, turns: 0, outputTokens: 0, genMs: 0 },
+        {
+          requests: 0,
+          turns: 0,
+          outputTokens: 0,
+          genMs: 0,
+          inputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+        },
       )
       const unlistedTps =
         unlistedTotals.genMs > 0 ? (unlistedTotals.outputTokens / unlistedTotals.genMs) * 1000 : null
+      // 缓存率与会话页、模型明细共用 cacheRateOf 的口径；输入侧为 0 时无读数。
+      const unlistedCacheRate = cacheRateOf(
+        unlistedTotals.inputTokens,
+        unlistedTotals.cacheReadTokens,
+        unlistedTotals.cacheCreationTokens,
+      )
 
       // 名单与按 id 计数都为空，才是真的没有可展示的子代理。
       if (agents.length === 0 && unlisted.length === 0) {
         return (
           <Box flexDirection="column">
-            <Text dimColor>子代理 · 独立统计，不计入会话累计</Text>
-            <Text dimColor>当前会话还没有子代理</Text>
+            <Text dimColor size="caption">子代理 · 独立统计，不计入会话累计</Text>
+            <Text dimColor size="caption">当前会话还没有子代理</Text>
           </Box>
         )
       }
 
+      // 名单内子代理的总览：输入/输出/缓存直接来自宿主 AgentInfo 的 usage 明细，
+      // 与卡片内的单代理读数同源；首个请求被 /cost 计数前 usage 为空，缓存率无读数。
       const agentUsage = agents.reduce(
         (acc, agent) => {
           const usageRows = agent.usage ?? []
           acc.input += usageRows.reduce((n, row) => n + row.input_tokens, 0)
           acc.output += usageRows.reduce((n, row) => n + row.output_tokens, 0)
+          acc.cacheRead += usageRows.reduce((n, row) => n + row.cache_read_input_tokens, 0)
+          acc.cacheCreation += usageRows.reduce((n, row) => n + row.cache_creation_input_tokens, 0)
           acc.cost += agent.cost?.usd ?? 0
           return acc
         },
-        { input: 0, output: 0, cost: 0 },
+        { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, cost: 0 },
       )
+      const agentCacheRate = cacheRateOf(agentUsage.input, agentUsage.cacheRead, agentUsage.cacheCreation)
       const requests = agents.reduce((n, agent) => n + (maps[agent.id]?.requests ?? 0), 0)
       const turns = agents.reduce((n, agent) => n + (maps[agent.id]?.turns ?? 0), 0)
       const genMs = agents.reduce((n, agent) => n + (maps[agent.id]?.genMs ?? 0), 0)
-      const avgTps = genMs > 0 ? (agentUsage.output / genMs) * 1000 : null
+      // 速度的分子必须与分母同源：genMs 来自插件的 turn.complete 累计，
+      // 因此输出也取同一累计，而不是宿主 /cost 账本（后者含重试、压缩等额外请求）。
+      const pluginOutput = agents.reduce((n, agent) => n + (maps[agent.id]?.outputTokens ?? 0), 0)
+      const avgTps = genMs > 0 ? (pluginOutput / genMs) * 1000 : null
 
       return (
-        <Box flexDirection="column">
-          <Text dimColor>子代理 · 独立统计，不计入会话累计</Text>
+        // 与其它视图一致：纵向间距统一交给 gap，不插入空 `<Text>` 行。
+        <Box flexDirection="column" gap={1}>
+          <Text dimColor size="caption">子代理 · 独立统计，不计入会话累计</Text>
           {agents.length > 0 && (
-            <Box flexDirection="column">
+            <Box flexDirection="column" gap={1}>
               <Box flexDirection="row" flexWrap="wrap" rowGap={1}>
                 {metric('总用量', fmtTokens(agentUsage.input + agentUsage.output))}
                 {metric('输入', fmtTokens(agentUsage.input))}
                 {metric('输出', fmtTokens(agentUsage.output))}
+                {metric('缓存率', agentCacheRate === null ? '—' : `${agentCacheRate.toFixed(1)}%`, cacheRateLevel(agentCacheRate))}
                 {metric('请求次数', String(requests))}
                 {metric('轮数', String(turns))}
                 {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`)}
                 {metric('估算费用', `$${agentUsage.cost.toFixed(2)}`)}
               </Box>
-              <Text dimColor>任务列表</Text>
-              {agents.map(agent => {
-                const counted = maps[agent.id]
-                const speed = counted && counted.genMs > 0 ? (counted.outputTokens / counted.genMs) * 1000 : null
-                return (
-                  <Box key={agent.id} flexDirection="column">
-                    <Text weight="semibold">
-                      {clip(agent.description || agent.id, Math.max(12, e.props.bodyColumns - 30))}
-                    </Text>
-                    <Text dimColor>{agent.type} · {agent.status} · {agent.model ? modelLabel(agent.model) : '未知模型'}</Text>
-                    <Text>
-                      Token {fmtTokens(agent.tokenCount)} · 请求 {counted?.requests ?? 0} · 速度{' '}
-                      {speed === null ? '—' : `${speed.toFixed(1)} t/s`}
-                    </Text>
-                  </Box>
-                )
-              })}
+              <Text dimColor size="caption">任务列表</Text>
+              {/* 每个子代理一张卡片：名称做主行，类型/状态/模型放小字，两行行内指标；
+                  卡片之间留一空行，避免多张卡的边框连成一片。 */}
+              <Box flexDirection="column" gap={1}>
+                {agents.map(agent => {
+                  const counted = maps[agent.id]
+                  const speed = counted && counted.genMs > 0 ? (counted.outputTokens / counted.genMs) * 1000 : null
+                  // 卡片内的输入/输出/缓存率取宿主 AgentInfo 的 usage 明细，与顶部总览同源；
+                  // usage 为空（首个请求尚未被 /cost 计数）时不显示 0，按「—」表示无读数。
+                  const usageRows = agent.usage ?? []
+                  const usageInput = usageRows.reduce((n, row) => n + row.input_tokens, 0)
+                  const usageOutput = usageRows.reduce((n, row) => n + row.output_tokens, 0)
+                  const usageCacheRate = cacheRateOf(
+                    usageInput,
+                    usageRows.reduce((n, row) => n + row.cache_read_input_tokens, 0),
+                    usageRows.reduce((n, row) => n + row.cache_creation_input_tokens, 0),
+                  )
+                  return (
+                    <Box key={agent.id} flexDirection="column" borderStyle="round" borderColor="#C8C8C8" paddingX={1}>
+                      <Text weight="bold">
+                        {clip(agent.description || agent.id, Math.max(12, e.props.bodyColumns - 30))}
+                      </Text>
+                      <Box flexDirection="row" gap={1} flexWrap="wrap">
+                        <Text dimColor size="caption">{agent.type}</Text>
+                        <Text dimColor size="caption">{agent.status}</Text>
+                        <Text dimColor size="caption">
+                          {agent.model ? modelLabel(agent.model) : '未知模型'}
+                        </Text>
+                      </Box>
+                      <Box flexDirection="row" gap={2} flexWrap="wrap">
+                        {compactMetric('输入', usageRows.length === 0 ? '—' : fmtTokens(usageInput))}
+                        {compactMetric('输出', usageRows.length === 0 ? '—' : fmtTokens(usageOutput))}
+                        {compactMetric('缓存率', usageCacheRate === null ? '—' : `${usageCacheRate.toFixed(1)}%`, cacheRateLevel(usageCacheRate))}
+                      </Box>
+                      <Box flexDirection="row" gap={2} flexWrap="wrap">
+                        {compactMetric('请求', String(counted?.requests ?? 0))}
+                        {compactMetric('速度', speed === null ? '—' : `${speed.toFixed(1)} t/s`)}
+                      </Box>
+                    </Box>
+                  )
+                })}
+              </Box>
             </Box>
           )}
           {unlisted.length > 0 && (
-            <Box flexDirection="column">
-              {agents.length > 0 && <Text>{' '}</Text>}
-              <Text dimColor>宿主未列出的代理循环（工作流子代理或引擎内部任务）</Text>
-              <Text>
-                请求 {unlistedTotals.requests} · 轮数 {unlistedTotals.turns} · 输出{' '}
-                {fmtTokens(unlistedTotals.outputTokens)} · 平均速度{' '}
-                {unlistedTps === null ? '—' : `${unlistedTps.toFixed(1)} t/s`}
+            <Box flexDirection="column" gap={1}>
+              <Text dimColor size="caption">
+                {narrow
+                  ? `未列出的代理循环 · ${unlisted.length} 个`
+                  : `宿主未列出的代理循环（工作流子代理或引擎内部任务）· ${unlisted.length} 个`}
               </Text>
-              <Text dimColor>宿主不提供这些循环的名称、模型与费用，仅按 agentId 计数。</Text>
+              {/* 每个字段独立成一个 Text，由 flexWrap 在字段之间换行：
+                  整行塞进一个 Text 时，窄面板会在字符中间断开，读起来像溢出。 */}
+              <Box flexDirection="row" gap={1} flexWrap="wrap">
+                <Text dimColor size="caption">合计</Text>
+                <Text dimColor size="caption">请求 {unlistedTotals.requests}</Text>
+                <Text dimColor size="caption">轮数 {unlistedTotals.turns}</Text>
+                <Text dimColor size="caption">输入 {fmtTokens(unlistedTotals.inputTokens)}</Text>
+                <Text dimColor size="caption">输出 {fmtTokens(unlistedTotals.outputTokens)}</Text>
+                <Text dimColor size="caption">缓存率</Text>
+                {unlistedCacheRate === null ? (
+                  <Text dimColor size="caption">—</Text>
+                ) : (
+                  <Text color={cacheRateLevel(unlistedCacheRate)} size="caption">
+                    {`${unlistedCacheRate.toFixed(1)}%`}
+                  </Text>
+                )}
+              </Box>
+              {/* 宿主不提供这些循环的名称与状态，列表按 agentId 分卡片；模型取最近一次响应，
+                  指标与会话页同口径，旧快照缺输入/缓存字段时按 0 展示；卡片间留一空行。 */}
+              <Box flexDirection="column" gap={1}>
+                {unlisted.map(([id, counted]) => {
+                  const speed = counted.genMs > 0 ? (counted.outputTokens / counted.genMs) * 1000 : null
+                  const rate = cacheRateOf(
+                    counted.inputTokens ?? 0,
+                    counted.cacheReadTokens ?? 0,
+                    counted.cacheCreationTokens ?? 0,
+                  )
+                  return (
+                    <Box key={id} flexDirection="column" borderStyle="round" borderColor="#C8C8C8" paddingX={1}>
+                      <Text dimColor size="caption">{clip(id, Math.max(12, e.props.bodyColumns - 6))}</Text>
+                      <Box flexDirection="row" gap={1} flexWrap="wrap">
+                        <Text dimColor size="caption">
+                          {counted.model ? modelLabel(counted.model) : '未知模型'}
+                        </Text>
+                        <Text dimColor size="caption">请求 {counted.requests}</Text>
+                        <Text dimColor size="caption">轮数 {counted.turns}</Text>
+                        <Text dimColor size="caption">
+                          速度 {speed === null ? '—' : `${speed.toFixed(1)} t/s`}
+                        </Text>
+                      </Box>
+                      <Box flexDirection="row" gap={2} flexWrap="wrap">
+                        {compactMetric('输入', fmtTokens(counted.inputTokens ?? 0))}
+                        {compactMetric('输出', fmtTokens(counted.outputTokens))}
+                        {compactMetric('缓存率', rate === null ? '—' : `${rate.toFixed(1)}%`, cacheRateLevel(rate))}
+                      </Box>
+                    </Box>
+                  )
+                })}
+              </Box>
+              {/* 脚注由外层 gap 分隔。 */}
+              <Text dimColor size="caption">宿主不提供这些循环的名称与费用；模型取最近一次响应。</Text>
             </Box>
           )}
         </Box>
@@ -1709,15 +2187,13 @@ function registerUi(on: On): void {
     }
 
     return (
-      <Box flexDirection="column">
+      <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" gap={1}>
           {tab('speed', '速度')}
           {tab('enhance', '增强')}
           {tab('session', '会话')}
           {tab('agents', '代理')}
         </Box>
-        {/* Pane 按行绘制，空 Box 不产生行；用一行空白 Text 撑开标签与内容的间距。 */}
-        <Text>{' '}</Text>
         {current === 'speed' && speedView()}
         {current === 'enhance' && enhanceView()}
         {current === 'session' && sessionView()}

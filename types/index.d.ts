@@ -68,6 +68,14 @@ export type AgentTotals = {
   turns: number
   genMs: number
   outputTokens: number
+  /** 输入侧 token（未缓存输入）；旧快照没有该字段，读取时按 0 处理。 */
+  inputTokens?: number
+  /** 缓存读取 token；旧快照没有该字段，读取时按 0 处理。 */
+  cacheReadTokens?: number
+  /** 缓存写入 token；旧快照没有该字段，读取时按 0 处理。 */
+  cacheCreationTokens?: number
+  /** 最近一次响应的模型 id；名单外循环在首个轮次完成前没有该字段。 */
+  model?: string
 }
 
 /** 一条提示词增强记录，写入跨会话存储。 */
