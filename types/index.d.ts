@@ -76,6 +76,14 @@ export type AgentTotals = {
   cacheCreationTokens?: number
   /** 最近一次响应的模型 id；名单外循环在首个轮次完成前没有该字段。 */
   model?: string
+  /** 所属 workflow run 的 id（如 wf_xxx）；由 agent.spawn 记录，旧快照没有。 */
+  workflowRunId?: string
+  /** 该子代理在所属 run 中的 agent() 序号（从 1 开始）；由 agent.spawn 记录。 */
+  workflowIndex?: number
+  /** 宿主在 spawn 时给的短描述；workflow 子代理可能为空或占位符。 */
+  spawnDescription?: string
+  /** 最后一次活动的 epoch 毫秒，用于列表按时间倒序；旧快照没有该字段。 */
+  lastSeenAt?: number
 }
 
 /** 一条提示词增强记录，写入跨会话存储。 */

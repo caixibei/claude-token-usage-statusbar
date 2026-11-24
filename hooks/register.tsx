@@ -521,6 +521,7 @@ function emptyAgent(): AgentTotals {
     inputTokens: 0,
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
+    lastSeenAt: 0,
   }
 }
 
@@ -619,6 +620,38 @@ function registerCollectors(on: On): void {
     return next({ ...e, text: enhanced })
   })
 
+  // 子代理启动：记录所属 workflow run 与序号，供代理页按运行分组、按时间倒序展示。
+  // 这是门控 hook（可改写 prompt/model、可拒绝），必须先放行 next(e)；
+  // 记录失败只写调试日志，不影响子代理启动。
+  on('agent.spawn', async ($, e, next) => {
+    const result = await next(e)
+    const agentId = result?.agentId
+    if (agentId === undefined) return result
+    try {
+      const now = await $.clock.now()
+      await update($, agentTotals, maps => {
+        const prev = maps[agentId] ?? emptyAgent()
+        return {
+          ...maps,
+          [agentId]: {
+            ...prev,
+            lastSeenAt: now,
+            workflowRunId: e.workflow?.runId ?? prev.workflowRunId,
+            workflowIndex: e.workflow?.agentIndex ?? prev.workflowIndex,
+            spawnDescription: e.description || prev.spawnDescription,
+          },
+        }
+      })
+      $.ui.log(
+        `usage-toolbar: agent.spawn 已记录 agent=${agentId} run=${e.workflow?.runId ?? '-'} index=${e.workflow?.agentIndex ?? '-'}`,
+        { to: 'debug' },
+      )
+    } catch (error) {
+      $.ui.log(`usage-toolbar: agent.spawn 记录分组失败 ${String(error)}`, { to: 'debug' })
+    }
+    return result
+  })
+
   // 轮次开始：记录起点，供 TTFT 与纯生成耗时使用。
   on('turn.start', async ($, e, next) => {
     const startedAt = await $.clock.now()
@@ -670,9 +703,11 @@ function registerCollectors(on: On): void {
       }))
     } else {
       const agentId = e.agentId
+      // 记录最后一次活动时间：代理页按时间倒序排列，最新的子代理排在最前。
+      const seenAt = await $.clock.now()
       await update($, agentTotals, maps => {
         const prev = maps[agentId] ?? emptyAgent()
-        return { ...maps, [agentId]: { ...prev, requests: prev.requests + 1 } }
+        return { ...maps, [agentId]: { ...prev, requests: prev.requests + 1, lastSeenAt: seenAt } }
       })
     }
 
@@ -825,6 +860,7 @@ function registerCollectors(on: On): void {
               cacheReadTokens: (prev.cacheReadTokens ?? 0) + round.cacheReadTokens,
               cacheCreationTokens: (prev.cacheCreationTokens ?? 0) + round.cacheCreationTokens,
               model: round.model === 'unknown' ? prev.model : round.model,
+              lastSeenAt: endedAt,
             },
           }
         })
@@ -1995,10 +2031,24 @@ function registerUi(on: On): void {
       // 窄侧栏下长文本会按字符折行，标题与指标字段需要拆成可换行的独立文本块。
       const narrow = e.props.bodyColumns < 48
       const listedIds = new Set(agents.map(agent => agent.id))
-      // 按请求数降序，活跃的循环排在前面；请求数相同则保持插入顺序。
+      // 按最后活动时间倒序：最新的子代理排在最前；旧快照没有时间字段时排在最后。
       const unlisted = Object.entries(maps)
         .filter(([id]) => !listedIds.has(id))
-        .sort(([, a], [, b]) => b.requests - a.requests)
+        .sort(([, a], [, b]) => (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0))
+      // 按 workflow run 分组：同一 run 的子代理排在一起，没有 runId 的旧记录归入「无分组」；
+      // 组之间按组内最新活动时间倒序，组内沿用上面的时间倒序。
+      const grouped = new Map<string, Array<[string, AgentTotals]>>()
+      for (const entry of unlisted) {
+        const key = entry[1].workflowRunId ?? ''
+        const bucket = grouped.get(key)
+        if (bucket) bucket.push(entry)
+        else grouped.set(key, [entry])
+      }
+      const unlistedGroups = Array.from(grouped.entries()).sort(([, a], [, b]) => {
+        const latest = (list: Array<[string, AgentTotals]>) =>
+          list.reduce((n, [, item]) => Math.max(n, item.lastSeenAt ?? 0), 0)
+        return latest(b) - latest(a)
+      })
       // 名单外循环的汇总：输入与缓存字段在旧快照里可能缺省，按 0 相加保证缓存率不发散。
       const unlistedTotals = unlisted.reduce(
         (acc, [, counted]) => ({
@@ -2146,38 +2196,56 @@ function registerUi(on: On): void {
                   </Text>
                 )}
               </Box>
-              {/* 宿主不提供这些循环的名称与状态，列表按 agentId 分卡片；模型取最近一次响应，
-                  指标与会话页同口径，旧快照缺输入/缓存字段时按 0 展示；卡片间留一空行。 */}
-              <Box flexDirection="column" gap={1}>
-                {unlisted.map(([id, counted]) => {
-                  const speed = counted.genMs > 0 ? (counted.outputTokens / counted.genMs) * 1000 : null
-                  const rate = cacheRateOf(
-                    counted.inputTokens ?? 0,
-                    counted.cacheReadTokens ?? 0,
-                    counted.cacheCreationTokens ?? 0,
-                  )
-                  return (
-                    <Box key={id} flexDirection="column" borderStyle="round" borderColor="#C8C8C8" paddingX={1}>
-                      <Text dimColor size="caption">{clip(id, Math.max(12, e.props.bodyColumns - 6))}</Text>
-                      <Box flexDirection="row" gap={1} flexWrap="wrap">
-                        <Text dimColor size="caption">
-                          {counted.model ? modelLabel(counted.model) : '未知模型'}
-                        </Text>
-                        <Text dimColor size="caption">请求 {counted.requests}</Text>
-                        <Text dimColor size="caption">轮数 {counted.turns}</Text>
-                        <Text dimColor size="caption">
-                          速度 {speed === null ? '—' : `${speed.toFixed(1)} t/s`}
-                        </Text>
-                      </Box>
-                      <Box flexDirection="row" gap={2} flexWrap="wrap">
-                        {compactMetric('输入', fmtTokens(counted.inputTokens ?? 0))}
-                        {compactMetric('输出', fmtTokens(counted.outputTokens))}
-                        {compactMetric('缓存率', rate === null ? '—' : `${rate.toFixed(1)}%`, cacheRateLevel(rate))}
-                      </Box>
-                    </Box>
-                  )
-                })}
-              </Box>
+              {/* 宿主不提供这些循环的脚本名与状态，列表按 workflow run 分组：
+                  组标题显示 run id 与数量，组内按 agentIndex 标注序号；无 runId 的旧记录
+                  归入「无分组」。指标与会话页同口径，旧快照缺输入/缓存字段时按 0 展示。 */}
+              {/* 组标题只在拿到 runId 时显示；旧记录没有 runId 时直接平铺，
+                  卡片标题回退到 agentId，不显示「无分组」这类空分组。 */}
+              {unlistedGroups.map(([runId, items]) => (
+                <Box key={runId === '' ? 'ungrouped' : runId} flexDirection="column" gap={1}>
+                  {runId !== '' && (
+                    <Text dimColor size="caption">{`${runId} · ${items.length} 个`}</Text>
+                  )}
+                  <Box flexDirection="column" gap={1}>
+                    {items.map(([id, counted]) => {
+                      const speed = counted.genMs > 0 ? (counted.outputTokens / counted.genMs) * 1000 : null
+                      const rate = cacheRateOf(
+                        counted.inputTokens ?? 0,
+                        counted.cacheReadTokens ?? 0,
+                        counted.cacheCreationTokens ?? 0,
+                      )
+                      return (
+                        <Box key={id} flexDirection="column" borderStyle="round" borderColor="#C8C8C8" paddingX={1}>
+                          <Text dimColor size="caption">
+                            {counted.workflowIndex !== undefined ? `#${counted.workflowIndex} · ` : ''}
+                            {counted.spawnDescription
+                              ? clip(counted.spawnDescription, Math.max(12, e.props.bodyColumns - 30))
+                              : clip(id, Math.max(12, e.props.bodyColumns - 6))}
+                          </Text>
+                          <Box flexDirection="row" gap={1} flexWrap="wrap">
+                            <Text dimColor size="caption">
+                              {counted.model ? modelLabel(counted.model) : '未知模型'}
+                            </Text>
+                            <Text dimColor size="caption">请求 {counted.requests}</Text>
+                            <Text dimColor size="caption">轮数 {counted.turns}</Text>
+                            <Text dimColor size="caption">
+                              速度 {speed === null ? '—' : `${speed.toFixed(1)} t/s`}
+                            </Text>
+                            <Text dimColor size="caption">
+                              最近 {counted.lastSeenAt ? formatTime(counted.lastSeenAt) : '—'}
+                            </Text>
+                          </Box>
+                          <Box flexDirection="row" gap={2} flexWrap="wrap">
+                            {compactMetric('输入', fmtTokens(counted.inputTokens ?? 0))}
+                            {compactMetric('输出', fmtTokens(counted.outputTokens))}
+                            {compactMetric('缓存率', rate === null ? '—' : `${rate.toFixed(1)}%`, cacheRateLevel(rate))}
+                          </Box>
+                        </Box>
+                      )
+                    })}
+                  </Box>
+                </Box>
+              ))}
               {/* 脚注由外层 gap 分隔。 */}
               <Text dimColor size="caption">宿主不提供这些循环的名称与费用；模型取最近一次响应。</Text>
             </Box>
