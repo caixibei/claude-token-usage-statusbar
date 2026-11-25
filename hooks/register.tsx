@@ -679,7 +679,7 @@ async function refreshStatus($: EngineInterface): Promise<void> {
 
 /** 注册用量采集相关的事件钩子。 */
 function registerCollectors(on: On): void {
-  // 提交前增强：以 !! 开头的普通消息在回合开始前改写，第一条消息也能用。
+  // 提交前增强：以 ++ 或「增强：」开头的普通消息在回合开始前改写，第一条消息也能用。
   // 斜杠命令、用户不可见的 meta prompt 和空草稿直接放行；增强失败时按原文提交。
   on('prompt.submit', async ($, e, next) => {
     const prefix = SUBMIT_ENHANCE_PREFIXES.find(item => e.text.startsWith(item))
@@ -949,6 +949,27 @@ function registerCollectors(on: On): void {
 // ---------------------------------------------------------------------------
 // 提示词增强
 // ---------------------------------------------------------------------------
+
+/**
+ * 输入框按钮与提交前前缀共用的系统提示词。
+ *
+ * <p>两条入口使用同一份指令，避免同一段草稿在「点按钮」和「加前缀提交」下得到
+ * 不同风格的改写。文本只允许语言层面的收紧：禁止模型新增需求、扩展范围或替用户
+ * 做业务决策，原文的业务约束必须原样保留。</p>
+ */
+const ENHANCE_SYSTEM_PROMPT = `你是一个提示词增强器。你的唯一职责是：在不改变、不扩展、不新增任何业务需求的前提下，把用户输入的提示词改写得更清晰、更结构化、更可执行。
+【禁止事项】（硬约束）
+1. 不得新增任何业务目标、场景、角色设定、功能点、数据字段、输出样例要求。
+2. 不得扩展需求范围（如把"写摘要"扩成"写摘要并做情感分析"）。
+3. 不得替用户做业务决策（如自行选定目标读者、自行规定字数、自行增加验收标准）。
+4. 不得删除用户原文中的任何业务约束；若某约束表述模糊，只能保留原意并标注"原文模糊，未改动"。
+5. 若原文已足够清晰，允许原样返回，不得为改而改。
+【允许的增强动作】（白名单）
+- 修正语法、错别字、标点。
+- 拆分长句、调整语序使逻辑更清晰。
+- 将隐含结构显式化（如把并列项改为分条列出），但不得新增条目。
+- 统一术语表述（同义词归并），不改变含义。
+- 补充格式说明（如"输出为 Markdown 列表"）仅当原文已有该意图时。`
 
 /** 从跨会话存储恢复增强记录；旧形状或损坏数据被忽略。 */
 async function loadRecords($: EngineInterface): Promise<void> {
@@ -1325,8 +1346,7 @@ async function runEnhance($: EngineInterface): Promise<void> {
   try {
     const result = await $.model.complete({
       model,
-      system:
-        '你是提示词改写助手。只输出改写后的提示词正文，不要解释、不要加引号或前后缀。保持原意，使表达更清晰、具体、可执行。',
+      system: ENHANCE_SYSTEM_PROMPT,
       prompt: original,
       maxTokens: 2048,
       effort: 'low',
@@ -1451,7 +1471,7 @@ async function clearEnhanceRecords($: EngineInterface, sessionId: string): Promi
 const SUBMIT_ENHANCE_PREFIXES = ['++', '增强：', '增强:']
 
 /**
- * 提交前增强：把 `!!` 后的草稿交给独立模型改写。
+ * 提交前增强：把剥掉触发前缀后的草稿交给独立模型改写。
  *
  * <p>模型来自当前会话；读取模型、调用失败或结果为空时返回 null，调用方按原文提交，
  * 绝不阻断发送。成功时与按钮增强共用同一份增强记录，面板的「增强」视图可见。</p>
@@ -1469,8 +1489,7 @@ async function enhanceForSubmit($: EngineInterface, original: string): Promise<s
   try {
     const result = await $.model.complete({
       model,
-      system:
-        '你是提示词改写助手。只输出改写后的提示词正文，不要解释、不要加引号或前后缀。保持原意，使表达更清晰、具体、可执行。',
+      system: ENHANCE_SYSTEM_PROMPT,
       prompt: original,
       maxTokens: 2048,
       effort: 'low',
