@@ -1,6 +1,6 @@
 {
   "name": "usage-toolbar",
-  "version": "0.2.43",
+  "version": "0.2.46",
   "description": "Claude Desktop 用量与提示词增强：实时生成速度、首字延迟、会话累计、子代理统计、上下文水位与提示词改写。",
   "author": { "name": "蔡熙贝" },
   "license": "MIT",
@@ -29,6 +29,20 @@
       "title": "速度块条满格（t/s）",
       "description": "窄面板速度块条的满格刻度：达到该值点亮全部格子，低于该值按比例缩短，便于跨轮次、跨会话比较条长。默认 300；留空或填非正数按默认值处理。峰值超过该值时自动按峰值向上取整到 100 的倍数，避免全部顶格。改动在插件重新加载后生效。",
       "default": 300
+    },
+    "allowSessionReset": {
+      "type": "string",
+      "title": "会话统计重置入口",
+      "description": "选择「不可重置」后，会话视图不再显示「重置统计…」入口，也不会注册 /resetusage 命令。默认「可重置」，改动在插件重新加载后生效。",
+      "options": ["可重置", "不可重置"],
+      "default": "可重置"
+    },
+    "allowEnhanceClear": {
+      "type": "string",
+      "title": "增强记录清空入口",
+      "description": "选择「不可重置」后，增强视图不再显示「清空记录…」入口，已有记录照常展示。默认「可重置」，改动在插件重新加载后生效。",
+      "options": ["可重置", "不可重置"],
+      "default": "可重置"
     }
   }
 }

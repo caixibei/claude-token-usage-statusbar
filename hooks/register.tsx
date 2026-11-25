@@ -585,6 +585,23 @@ function applySpeedConfig(options: PluginOptions): void {
   speedConfigIssue = `块条满格基准无效（${String(raw)}），已回退默认 ${DEFAULT_BAR_FULL_SCALE_TPS} t/s`
 }
 
+/**
+ * 是否允许重置当前会话统计。
+ *
+ * <p>来自 userConfig 的 allowSessionReset 选项，默认「可重置」。选择「不可重置」后
+ * 面板不渲染重置入口、不注册 /resetusage 命令；已注册的命令由 command.run 处理器
+ * 再次拦截。配置改动会重新加载模块并再次执行 applyResetConfig。</p>
+ */
+let canResetSession = true
+/** 是否允许清空当前会话的增强记录；来源与生效方式同上（allowEnhanceClear）。 */
+let canClearEnhance = true
+
+/** 按 userConfig 重建两项重置开关；只有显式选择「不可重置」才关闭，缺省按可重置处理。 */
+function applyResetConfig(options: PluginOptions): void {
+  canResetSession = options['allowSessionReset'] !== '不可重置'
+  canClearEnhance = options['allowEnhanceClear'] !== '不可重置'
+}
+
 function emptyAgent(): AgentTotals {
   return {
     requests: 0,
@@ -1619,8 +1636,8 @@ function registerUi(on: On): void {
     // 终端绘制时保持 null，由字符条形图承担趋势展示。
     const SvgTag = e.surface === 'terminal' ? null : $.ui.resolve(e).Svg
     const current = await read($, view)
-    const confirmingReset = await read($, resetConfirming)
-    const confirmingClear = await read($, clearConfirming)
+    const confirmingReset = canResetSession ? await read($, resetConfirming) : false
+    const confirmingClear = canClearEnhance ? await read($, clearConfirming) : false
     const list = await read($, rounds)
     const sum = await read($, totals)
     const maps = await read($, agentTotals)
@@ -1870,33 +1887,37 @@ function registerUi(on: On): void {
           <Box flexDirection="row" width={e.props.bodyColumns}>
             <Text dimColor size="caption">最近增强记录 {records.length} 条</Text>
             <Box flexGrow={1} />
-            <Button
-              key="clear-records"
-              label="清空记录…"
-              onPress={() => {
-                if (!currentSessionId) {
-                  $.ui.log('usage-toolbar: 未取得会话 id，跳过清空增强记录', { to: 'debug' })
-                  return
-                }
-                void update($, clearConfirming, () => true)
-              }}
-            />
+            {canClearEnhance && (
+              <Button
+                key="clear-records"
+                label="清空记录…"
+                onPress={() => {
+                  if (!currentSessionId) {
+                    $.ui.log('usage-toolbar: 未取得会话 id，跳过清空增强记录', { to: 'debug' })
+                    return
+                  }
+                  void update($, clearConfirming, () => true)
+                }}
+              />
+            )}
           </Box>
           {/* 与重置告警同一形态：左侧红色竖条 + 红色标题说明范围，正文保持默认色，
               确认放在面板内部，不写入会话。 */}
           {/* 左侧竖条用 Box 背景色绘制：块字符受行距影响会断成三段，背景色块可以连续铺满，
               alignSelf="stretch" 让它与右侧文字块等高；字符保留作背景色不可用时的兜底。 */}
-          <Box flexDirection="row" gap={1} alignItems="stretch">
-            <Box width={1} backgroundColor="error">
-              <Text color="error">{'▌\n▌\n▌'}</Text>
+          {canClearEnhance && (
+            <Box flexDirection="row" gap={1} alignItems="stretch">
+              <Box width={1} backgroundColor="error">
+                <Text color="error">{'▌\n▌\n▌'}</Text>
+              </Box>
+              <Box flexDirection="column">
+                <Text weight="bold" color="error">清空当前会话的增强记录</Text>
+                <Text>删除当前会话的全部增强记录，且无法恢复。</Text>
+                <Text dimColor>其他会话的记录不受影响。</Text>
+              </Box>
             </Box>
-            <Box flexDirection="column">
-              <Text weight="bold" color="error">清空当前会话的增强记录</Text>
-              <Text>删除当前会话的全部增强记录，且无法恢复。</Text>
-              <Text dimColor>其他会话的记录不受影响。</Text>
-            </Box>
-          </Box>
-          {confirmingClear && (
+          )}
+          {canClearEnhance && confirmingClear && (
             <Box flexDirection="column">
               <Text weight="bold">确认清空？此操作无法恢复。</Text>
               <Box flexDirection="row" width={e.props.bodyColumns} gap={1}>
@@ -2002,7 +2023,7 @@ function registerUi(on: On): void {
             <Box flexDirection="column" flexGrow={1} borderStyle="round" borderColor="#C8C8C8" paddingX={1} paddingY={1}>
               <Text dimColor size="caption" weight="bold">估算费用</Text>
               <Text size="heading">{cost === null ? '不可得' : `$${cost.toFixed(2)}`}</Text>
-              <Text dimColor size="caption">本地估算</Text>
+              <Text dimColor size="caption">本地估算 · 不受重置影响</Text>
             </Box>
             <Box flexDirection="column" flexGrow={1} borderStyle="round" borderColor="#C8C8C8" paddingX={1} paddingY={1}>
               <Text dimColor size="caption" weight="bold">上下文</Text>
@@ -2115,17 +2136,19 @@ function registerUi(on: On): void {
               左侧红色竖条 + 红色标题常驻说明清空范围与不可恢复性，正文保持默认色，既保留告警
               语义，又不与上方数据抢视觉；确认放在面板内部，不调用会写入会话的 AskUserQuestion 卡片。 */}
           {/* 与增强视图的清空告警同一形态：背景色块竖条 + 拉伸等高，避免字符行距造成断线。 */}
-          <Box flexDirection="row" gap={1} alignItems="stretch">
-            <Box width={1} backgroundColor="error">
-              <Text color="error">{'▌\n▌\n▌'}</Text>
+          {canResetSession && (
+            <Box flexDirection="row" gap={1} alignItems="stretch">
+              <Box width={1} backgroundColor="error">
+                <Text color="error">{'▌\n▌\n▌'}</Text>
+              </Box>
+              <Box flexDirection="column">
+                <Text weight="bold" color="error">重置当前会话统计</Text>
+                <Text>清空本会话的轮次与累计，并删除数据库中该会话的记录。</Text>
+                <Text dimColor>删除后无法恢复；其他会话的数据不受影响。</Text>
+              </Box>
             </Box>
-            <Box flexDirection="column">
-              <Text weight="bold" color="error">重置当前会话统计</Text>
-              <Text>清空本会话的轮次与累计，并删除数据库中该会话的记录。</Text>
-              <Text dimColor>删除后无法恢复；其他会话的数据不受影响。</Text>
-            </Box>
-          </Box>
-          {confirmingReset ? (
+          )}
+          {canResetSession && (confirmingReset ? (
             <Box flexDirection="column">
               <Text weight="bold">确认重置？此操作无法恢复。</Text>
               <Box flexDirection="row" width={e.props.bodyColumns} gap={1}>
@@ -2160,7 +2183,7 @@ function registerUi(on: On): void {
                 {'重置统计…'}
               </Button>
             </Box>
-          )}
+          ))}
         </Box>
       )
     }
@@ -2421,6 +2444,7 @@ export const register: Register = (on, options) => {
   // 延迟分档阈值来自 userConfig；/config 改动会重新加载模块并再次执行这里。
   applyLatencyConfig(options)
   applySpeedConfig(options)
+  applyResetConfig(options)
   registerCollectors(on)
   registerUi(on)
 
@@ -2466,7 +2490,13 @@ export const register: Register = (on, options) => {
     void startHistoryLoad($)
     await $.command.register({ name: 'usagebar', description: '打开用量面板' })
     await $.command.register({ name: 'enhance', description: '增强当前输入框草稿' })
-    await $.command.register({ name: 'resetusage', description: '重置当前会话统计' })
+    // 重置开关关闭时不注册命令；已注册的旧命令由 command.run 处理器拦截。
+    if (canResetSession) {
+      await $.command.register({ name: 'resetusage', description: '重置当前会话统计' })
+    }
+    // 开关关闭时清掉可能残留的确认态，避免重新开启后直接落在确认步骤。
+    if (!canResetSession) await update($, resetConfirming, () => false)
+    if (!canClearEnhance) await update($, clearConfirming, () => false)
     await refreshStatus($)
 
     // 语录轮播：每秒推进动画帧，每 5 秒换一句；只有主循环生成时才写入。
@@ -2504,6 +2534,12 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'resetusage' }, async $ => {
+    // 配置关闭后命令可能仍留在旧注册里，这里再拦一次，避免绕过开关执行重置。
+    if (!canResetSession) {
+      $.ui.log('usage-toolbar: 重置功能已关闭，忽略 /resetusage', { to: 'debug' })
+      $.ui.toast('重置会话统计已在配置中关闭')
+      return {}
+    }
     // 不直接重置，也不在会话里弹确认卡：打开面板并停在第二步确认。
     // 不返回 text：成功或取消都不在对话里留行。
     const opened = await openUsagePane($)

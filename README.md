@@ -1,6 +1,6 @@
 # 📊 usage-toolbar
 
-[![Version](https://img.shields.io/badge/version-0.2.43-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.2.46-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Claude%20Desktop%20%7C%20Claude%20Code-6f42c1?style=flat-square)
 ![Type](https://img.shields.io/badge/type-Claude%20mod-ff8c00?style=flat-square)
@@ -39,8 +39,8 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：⚡ 实时生成�
 - 📉 **底部状态行**：生成中显示实时估算速度；结束后不显示速率，只保留本轮/会话 token 与上下文占比，例如 `本轮 327 · 会话 289.9万 · 上下文 12%`
 - ⌨️ **`/usagebar`**：打开用量面板（宿主已保留 `/usage`，因此命令名为 `usagebar`）
 - ✨ **`/enhance`**：增强当前输入框草稿
-- 🧹 **清空记录**：增强视图右上角的「清空记录…」使用面板内两步确认，只删除当前会话的增强记录，删除后无法恢复；确认不会写入会话
-- ♻️ **`/resetusage`**：重置当前会话统计；会话视图底部的「重置统计…」按钮效果相同。两个入口都使用面板内两步确认：先点「重置统计…」，再点「确认重置」；`/resetusage` 会打开面板并停在确认步骤。确认只存在于面板内，不会写入会话。取消、切换页签或关闭面板都视为取消；重置成功或取消都不向对话发送消息，诊断信息只写入调试日志
+- 🧹 **清空记录**：增强视图右上角的「清空记录…」使用面板内两步确认，只删除当前会话的增强记录，删除后无法恢复；确认不会写入会话；可在 `userConfig` 中把 `allowEnhanceClear` 设为「不可重置」关闭该入口
+- ♻️ **`/resetusage`**：重置当前会话统计；会话视图底部的「重置统计…」按钮效果相同。两个入口都使用面板内两步确认：先点「重置统计…」，再点「确认重置」；`/resetusage` 会打开面板并停在确认步骤。确认只存在于面板内，不会写入会话。取消、切换页签或关闭面板都视为取消；重置成功或取消都不向对话发送消息，诊断信息只写入调试日志；可在 `userConfig` 中把 `allowSessionReset` 设为「不可重置」关闭该入口与命令
 - 🚀 **发送前增强**：消息以 `++` 或 `增强：` 开头时，提交前用当前模型改写再发出；第一条消息也能用，普通消息不受影响。不要用 `!`：宿主会把行首 `!` 交给 shell
 - 🗂️ **面板四个视图**：速度、增强、会话、代理；面板以对话框形态打开，Esc 关闭
 - 🔄 **面板刷新**：面板由宿主拉取式绘制，插件在每次模型响应结束、宿主测量推送与压缩完成后请求重绘；面板里的上下文与费用始终来自最近一次宿主读数
@@ -76,7 +76,7 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：⚡ 实时生成�
 - Token 构成：输入、输出、缓存读取、缓存写入与缓存率，缓存率按 95/90/80 三档着色
 - 请求与性能：请求次数、轮数、平均耗时、平均延迟、平均速度，按各自档位着色
 - 模型明细：每个模型的输出 token、请求数与缓存率，多模型会话分行展示
-- 底部「重置统计…」两步确认后清空本会话统计与数据库记录，其他会话不受影响
+- 底部「重置统计…」两步确认后清空本会话统计与数据库记录，其他会话不受影响；估算费用是宿主对整条会话的累计读数，不随重置清空
 
 #### 🤖 代理：子代理与未列出循环
 
@@ -127,6 +127,17 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：⚡ 实时生成�
 
 - 三个值必须为正数且严格递增；否则整体回退默认 2/4/8，并在调试日志记录回退原因。
 - 配置改动会在插件重新加载后生效。
+
+### 🔒 重置开关
+
+两项破坏性入口各自独立配置，选择「不可重置」后对应按钮与命令都不出现（默认「可重置」）：
+
+| 配置项 | 作用 | 取值 | 默认 |
+|---|---|---|---|
+| `allowSessionReset` | 会话视图的「重置统计…」与 `/resetusage` 命令 | 可重置 / 不可重置 | 可重置 |
+| `allowEnhanceClear` | 增强视图的「清空记录…」入口 | 可重置 / 不可重置 | 可重置 |
+
+`/config` 中对应 `usage-toolbar.allowSessionReset`、`usage-toolbar.allowEnhanceClear`；也可以写入 `~/.claude/settings.json` 的 `pluginConfigs.usage-toolbar.options`。配置改动在插件重新加载后生效。
 
 ## 📊 数据口径
 
