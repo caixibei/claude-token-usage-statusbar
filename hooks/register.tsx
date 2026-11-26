@@ -88,8 +88,10 @@ const ticker = atom(
 
 /** 增强记录跨会话存储键；最多保留 200 条。 */
 const ENHANCE_STORE_KEY = 'enhance-records'
-/** 用量历史跨会话存储键，保存最近 100 轮与累计快照。 */
+/** 用量历史跨会话存储键前缀；每个会话单独一个 key，保存最近 100 轮与累计快照。 */
 const HISTORY_STORE_KEY = 'usage-history'
+/** 本地快照最多保留的会话数；$.store 是所有会话共享的空间，必须限总量。 */
+const HISTORY_STORE_KEEP = 5
 const RECORD_LIMIT = 200
 const TEXT_LIMIT = 4000
 /**
@@ -100,6 +102,21 @@ const TEXT_LIMIT = 4000
  * 会立即刷新，之后每 500 毫秒最多刷新一次。</p>
  */
 const STATUS_FLUSH_MS = 500
+
+/**
+ * 面板文本行的估算像素高度。
+ *
+ * <p>宿主只提供可用行数 {@code bodyRows}，没有行数到像素的换算 API；SVG 高度是 CSS
+ * 像素，因此需要这个常量把行数预算翻译成图高。取 18 偏保守：估大会让内容溢出成
+ * 滚动，估小只会在底部留一两行空白。</p>
+ */
+const PANE_ROW_PX = 18
+/** 速度视图里除图表与块条之外的固定文本行数：标题、主数值、两组图题与说明、指标行。 */
+const SPEED_FIXED_TEXT_ROWS = 9
+/** 速度视图内各图题与块条之间的间距合计（像素），按现有 gap 步长估算并入预算。 */
+const SPEED_GAP_PX = 96
+/** 块条每行的绘制高度；比早期 10px 略松，行距由它自身撑开，不需要额外的行间 gap。 */
+const BAR_ROW_HEIGHT = 12
 
 /** 轮播定时器间隔：每 250 毫秒推进一帧点阵旋转图标，计时仍按整秒显示。 */
 const TICKER_TICK_MS = 250
@@ -1012,6 +1029,9 @@ function registerCollectors(on: On): void {
 
     try {
       if (e.agentId === undefined) {
+        // 宿主在 /rewind 后会重建会话级 state；先按库回填再追加本轮，
+        // 否则本轮会成为唯一一条记录，面板与累计都只剩这一轮。
+        await ensureSessionRestored($)
         await update($, rounds, list => [...list, round].slice(-100))
         await update($, totals, current => addRoundTotals(current, round))
         await update($, ticker, () => null)
@@ -1125,31 +1145,62 @@ async function runUsageStore(
 }
 
 /**
- * 读取本地存储中的会话记录，只用于回填当前会话的统计。
+ * 读取本地历史快照，只用于回填当前会话的统计。
  *
- * <p>其他会话的数据仅在内存中短暂参与匹配，不会被写入状态或展示。</p>
+ * <p>数据来源有两处：SQLite 的最近会话，以及 $.store 里按会话分 key 的快照。
+ * 后者既承接旧版本写过的单 key 快照，也覆盖 SQLite 写入失败的会话；两处结果
+ * 按会话 id 去重后交给回填，其他会话的数据仅在内存中短暂参与匹配。</p>
  */
 async function loadHistory($: EngineInterface): Promise<void> {
+  const entries: HistoryEntry[] = []
+
   try {
     const result = await runUsageStore($, ['load', '20'])
-    const entries = JSON.parse(result.stdout.trim()) as HistoryEntry[]
-    if (Array.isArray(entries)) {
-      await restoreSessionStats($, entries)
-      return
-    }
+    const parsed = JSON.parse(result.stdout.trim()) as HistoryEntry[]
+    if (Array.isArray(parsed)) entries.push(...parsed)
   } catch (error) {
     $.ui.log(`usage-toolbar: 读取 SQLite 历史失败 ${String(error)}`)
   }
 
-  // 旧版本只写过 $.store 单快照；SQLite 不可用时仍尽力用它回填。
+  // SQLite 不可用或该会话只在快照里时，仍能从这里回填；旧单 key 快照也落在
+  // 同一前缀下，一并读取。同一会话以 SQLite 的记录为准，跳过重复快照。
   try {
-    const stored = await $.store.get(HISTORY_STORE_KEY)
-    const candidate = stored as HistoryEntry | null
-    if (candidate && Array.isArray(candidate.rounds) && candidate.sessionId) {
-      await restoreSessionStats($, [candidate])
+    for (const key of await $.store.keys()) {
+      if (key !== HISTORY_STORE_KEY && !key.startsWith(`${HISTORY_STORE_KEY}:`)) continue
+      const stored = (await $.store.get(key)) as HistoryEntry | null
+      if (!stored || !Array.isArray(stored.rounds) || !stored.sessionId) continue
+      if (entries.some(item => item.sessionId === stored.sessionId)) continue
+      entries.push(stored)
     }
   } catch (error) {
     $.ui.log(`usage-toolbar: 读取本地历史回退失败 ${String(error)}`)
+  }
+
+  await restoreSessionStats($, entries)
+}
+
+/** 某个会话的本地快照 key；旧版本只写过不带后缀的单 key。 */
+function historyStoreKey(sessionId: string): string {
+  return `${HISTORY_STORE_KEY}:${sessionId}`
+}
+
+/**
+ * 限制本地快照数量：按写入顺序保留最近若干条，删除更早的会话快照。
+ *
+ * <p>快照按会话分 key 后不再互相覆盖，但 $.store 是所有会话共享的 4 MiB 空间，
+ * 必须限制总量。keys() 按插入顺序返回，当前会话刚写入、位于末尾，不会被删。</p>
+ */
+async function pruneHistorySnapshots($: EngineInterface, sessionId: string): Promise<void> {
+  const keys = (await $.store.keys()).filter(
+    key => key === HISTORY_STORE_KEY || key.startsWith(`${HISTORY_STORE_KEY}:`),
+  )
+  const currentKey = historyStoreKey(sessionId)
+  const others = keys.filter(key => key !== currentKey)
+  // 当前会话刚写入，优先保留；其余按插入顺序保留最新的若干条。
+  const kept = new Set(others.slice(-(HISTORY_STORE_KEEP - 1)))
+  for (const key of others) {
+    if (kept.has(key)) continue
+    await $.store.delete(key)
   }
 }
 
@@ -1210,6 +1261,31 @@ async function restoreSessionStats(
   } catch (error) {
     $.ui.log(`usage-toolbar: 回填当前会话统计失败 ${String(error)}`)
   }
+}
+
+/** 是否已排队一次空数据回填，避免同一次重绘重复触发。 */
+let emptyRestoreQueued = false
+
+/**
+ * 渲染时发现内存统计为空，排队一次数据库回填。
+ *
+ * <p>宿主在 /rewind 后会重建会话级 {@code $.state}，而 rewind 没有对应的插件钩子；
+ * 面板与状态行只读内存，不补这次回填就会一直显示空数据。渲染钩子内不允许写 state，
+ * 因此用零延迟定时器推到下一帧；回填写入后，读取过该值的绘制会被宿主重绘。</p>
+ */
+function scheduleEmptyRestore(
+  $: EngineInterface,
+  list: UsageRound[],
+  sum: SessionTotals,
+): void {
+  if (emptyRestoreQueued) return
+  // 有轮次或已有累计说明内存状态完整，不需要回填。
+  if (list.length > 0 || sum.turns > 0) return
+  emptyRestoreQueued = true
+  $.clock.after(0, () => {
+    emptyRestoreQueued = false
+    void ensureSessionRestored($)
+  })
 }
 
 /**
@@ -1319,9 +1395,11 @@ async function resetSessionStats($: EngineInterface): Promise<void> {
   // 内存已清空，界面立即收起确认态；后续删除数据库失败只提示，不回滚已清空的内存统计。
   await update($, resetConfirming, () => false)
 
-  // 旧版本的单会话快照只在 SQLite 不可用时作为回退，一并删除避免恢复出旧数据。
+  // 快照按会话分 key，只删本会话的；旧版本的单 key 快照先核对归属，避免误删其他会话。
   try {
-    await $.store.delete(HISTORY_STORE_KEY)
+    await $.store.delete(historyStoreKey(sessionId))
+    const legacy = (await $.store.get(HISTORY_STORE_KEY)) as HistoryEntry | null
+    if (legacy?.sessionId === sessionId) await $.store.delete(HISTORY_STORE_KEY)
   } catch (error) {
     $.ui.log(`usage-toolbar: 重置本地快照失败 ${String(error)}`, { to: 'debug' })
   }
@@ -1341,7 +1419,8 @@ async function resetSessionStats($: EngineInterface): Promise<void> {
 /**
  * 把当前会话的轮次、累计、费用与上下文写入本地 SQLite。
  *
- * <p>写入按会话 ID 区分，不并入其他会话统计。SQLite 失败时写 $.store 单快照作为回退。</p>
+ * <p>写入按会话 ID 区分，不并入其他会话统计。SQLite 失败时按会话分 key 写
+ * $.store 快照作为回退，避免并行会话互相覆盖。</p>
  */
 async function saveHistory($: EngineInterface): Promise<void> {
   let payload: HistoryEntry | null = null
@@ -1353,6 +1432,15 @@ async function saveHistory($: EngineInterface): Promise<void> {
       read($, totals),
       read($, agentTotals),
     ])
+    // 内存轮次为空时不写库：宿主在 /rewind 后会重建会话级 state，
+    // 此时写回会把该会话的累计覆盖成 0，而轮次明细仍留在表里。
+    if (list.length === 0) {
+      $.ui.log(`usage-toolbar: 内存轮次为空，跳过一次历史写入 session=${sessionId}`, {
+        to: 'debug',
+      })
+      return
+    }
+
     let costUsd: number | undefined
     let contextPercent: number | undefined
     try {
@@ -1378,7 +1466,8 @@ async function saveHistory($: EngineInterface): Promise<void> {
     $.ui.log(`usage-toolbar: 保存 SQLite 历史失败 ${String(error)}`)
     if (payload) {
       try {
-        await $.store.set(HISTORY_STORE_KEY, payload)
+        await $.store.set(historyStoreKey(payload.sessionId), payload)
+        await pruneHistorySnapshots($, payload.sessionId)
       } catch (storeError) {
         $.ui.log(`usage-toolbar: 保存历史回退失败 ${String(storeError)}`)
       }
@@ -1661,6 +1750,9 @@ function registerUi(on: On): void {
     const { Box, Text, Button } = $.ui.resolve(e)
     const tick = await read($, ticker)
     const list = await read($, rounds)
+    const sum = await read($, totals)
+    // rewind 会清空会话级 state；这里只排队回填，不在绘制中写 state。
+    scheduleEmptyRestore($, list, sum)
     const now = await $.clock.now()
     const last = list.length > 0 ? (list[list.length - 1] ?? null) : null
 
@@ -1727,6 +1819,8 @@ function registerUi(on: On): void {
     const confirmingClear = canClearEnhance ? await read($, clearConfirming) : false
     const list = await read($, rounds)
     const sum = await read($, totals)
+    // 面板在 rewind 时可能一直开着；空数据同样排队一次回填。
+    scheduleEmptyRestore($, list, sum)
     const maps = await read($, agentTotals)
     const allRecords = await read($, enhanceRecords)
 
@@ -1850,18 +1944,33 @@ function registerUi(on: On): void {
       // 图表像素宽度随面板列数增长：每列按 7.6px 保守估算（宁可略窄也不越过槽位），下界 540 保持窄面板
       // 刻度不被压缩，上界 1080 避免超宽面板把绘图区拉成细线。
       const chartWidth = Math.min(1080, Math.max(540, Math.round(e.props.bodyColumns * 7.6)))
-      // 高度按宽度比例分配：侧栏面板通常远高于内容，早期固定 110/160px 会在下方留下大片空白。
-      // 折线约取宽度的 37%，柱状图约取 56%，并设上下限避免窄面板压扁、超宽面板拉得过长。
-      const chartHeight = Math.min(260, Math.max(110, Math.round(chartWidth * 0.37)))
+      // 高度按面板可用行数分配：面板由用户拖拽，早期只按宽度算图高，拉高时多出的行
+      // 全留在底部，拉矮时又把块条挤进滚动区。预算顺序为固定文本 → 块条 → 两块图，
+      // 剩余像素按 4:6 分给折线与柱状图；取不到行数时退回按宽度的旧口径（0.37 + 0.56）。
+      const bodyRows = e.props.scroll?.bodyRows ?? 0
+      const svgBudget =
+        bodyRows > 0
+          ? Math.max(
+              0,
+              bodyRows * PANE_ROW_PX -
+                SPEED_FIXED_TEXT_ROWS * PANE_ROW_PX -
+                SPEED_GAP_PX -
+                barRows.length * BAR_ROW_HEIGHT,
+            )
+          : Math.round(chartWidth * 0.93)
+      // 两块图共用一份预算；上下限沿用早期口径（折线不低于 110、柱状不低于 160），
+      // 上限防止超高面板把折线拉成陡壁、把柱子拉成细条。
+      const svgTotal = Math.min(860, Math.max(270, svgBudget))
+      const chartHeight = Math.min(300, Math.max(110, Math.round(svgTotal * 0.4)))
       const chartSvg = showChart ? speedChartSvg(trend, level.color ?? '#17C964', chartWidth, chartHeight) : ''
       // 块条长度基准来自 userConfig（默认 300 t/s）：读数按绝对比例点亮，不同轮次、
       // 不同会话的条长才可比。早前以本轮最大值为满格基准，171 t/s 就顶格，快慢差异
       // 被压平。峰值超过基准时按实际峰值向上取整到 100 的倍数，避免全部顶格后再次
       // 失去分辨率。这里只决定条长；颜色统一由 speedColor 按配置的满格刻度取档。
       const barFullScale = Math.max(barFullScaleTps, Math.ceil((peak ?? 0) / 100) * 100)
-      // 宽面板柱状图：高度与折线图同口径放大，柱色走 speedColor 的统一分档；
+      // 宽面板柱状图：与折线图共用同一份高度预算，柱色走 speedColor 的统一分档；
       // 柱高仍按图表自身峰值自适应，保留分布分辨率。
-      const barsHeight = Math.min(360, Math.max(160, Math.round(chartWidth * 0.56)))
+      const barsHeight = Math.min(460, Math.max(160, Math.round(svgTotal * 0.6)))
       const barColors = rows.map(round => speedColor(tpsOfRound(round)) ?? '#17C964')
       const barsSvg = showChart ? speedBarsSvg(trend, barColors, chartWidth, barsHeight) : ''
       // 窄面板块条：序号 2 列 + 两个间距 + 数值列，其余列给条；按 7.6px/列换算，与图表
@@ -1971,10 +2080,16 @@ function registerUi(on: On): void {
                             <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')}</Text>
                           </Box>
                           <SvgTag
-                            source={speedBarRowSvg(tps, barFullScale, ratioColor ?? '#17C964', barRowPx, 10)}
+                            source={speedBarRowSvg(
+                              tps,
+                              barFullScale,
+                              ratioColor ?? '#17C964',
+                              barRowPx,
+                              BAR_ROW_HEIGHT,
+                            )}
                             alt={`第 ${index + 1} 轮生成速度 ${tps.toFixed(1)} t/s`}
                             width={barRowPx}
-                            height={10}
+                            height={BAR_ROW_HEIGHT}
                           />
                           <Box width={valueCols} justifyContent="flex-end">
                             <Text color={ratioColor} size="caption">{tps.toFixed(1)}</Text>
@@ -2570,9 +2685,13 @@ export const register: Register = (on, options) => {
   registerUi(on)
 
   // 宿主测量推送：每轮主循环结束后与配额窗口变化时给出最新上下文与费用。
-  // 这里只同步上下文缓存并要求面板重绘，不写 state，避免干扰生成中的状态行。
+  // 正常测量只同步上下文缓存并要求面板重绘；回填仅在内存为空时写 state，
+  // 用于 /rewind 重建会话状态后的自愈，不影响生成中的状态行。
   on('session.measure', async ($, e, next) => {
     statusCache.contextPercent = e.context.percent ?? null
+    // rewind 后宿主重建了会话级 state：每轮测量时补一次回填，让本轮结束时的
+    // 累计基于完整历史而不是仅本轮。不 await，避免拖慢测量事件的其它钩子。
+    void ensureSessionRestored($)
     $.ui.invalidate('ui.render')
     return next(e)
   })
