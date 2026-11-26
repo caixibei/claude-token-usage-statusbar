@@ -225,23 +225,64 @@ function modelLabel(model: string): string {
 }
 
 /**
- * 速度档位与颜色：按参考插件的档位说明图分级。
+ * 速度档位标签：按参考插件的档位说明图分级。
  *
- * <p>区间左闭右开（如 40-70 表示 40 ≤ 速度 &lt; 70）；颜色取自该图各档位文字的主色，
- * 终端会按 256 色近似渲染。label 直接使用区间文本，与图例保持一致。</p>
+ * <p>区间左闭右开（如 40-70 表示 40 ≤ 速度 &lt; 70），文本直接使用区间描述，与图例
+ * 保持一致。只返回文本：所有 tps 读数的颜色统一由 {@link speedColor} 按达成满格的
+ * 比例计算，同一读数在任何视图里颜色一致。</p>
  */
-function tpsLevel(tps: number | null): { label: string; color: string } {
-  if (tps === null) return { label: '—', color: 'gray' }
-  if (tps < 40) return { label: '<40', color: '#DF7A68' }
-  if (tps < 70) return { label: '40-70', color: '#C19145' }
-  if (tps < 150) return { label: '70-150', color: '#3AAC85' }
-  if (tps < 200) return { label: '150-200', color: '#2C8F87' }
-  if (tps < 300) return { label: '200-300', color: '#2784B0' }
-  if (tps < 500) return { label: '300-500', color: '#5974D4' }
-  if (tps < 800) return { label: '500-800', color: '#7762CC' }
-  if (tps < 1000) return { label: '800-1000', color: '#8E57C3' }
-  if (tps < 2000) return { label: '1000-2000', color: '#A14FB1' }
-  return { label: '≥2000', color: '#7F62D1' }
+function tpsLabel(tps: number | null): string {
+  if (tps === null) return '—'
+  if (tps < 40) return '<40'
+  if (tps < 70) return '40-70'
+  if (tps < 150) return '70-150'
+  if (tps < 200) return '150-200'
+  if (tps < 300) return '200-300'
+  if (tps < 500) return '300-500'
+  if (tps < 800) return '500-800'
+  if (tps < 1000) return '800-1000'
+  if (tps < 2000) return '1000-2000'
+  return '≥2000'
+}
+
+/**
+ * 块条达成比例的分档阈值与配色：按「本轮速度 / 满格刻度」取 5 档。
+ *
+ * <p>为什么不用十档绝对速度色：块条长度本身就是「离满格还有多远」，颜色若按绝对速度
+ * 取值，同一根条的长度和颜色会各说各话。改用同一比例后，条越长颜色越冷，读数一眼可懂。</p>
+ *
+ * <p>为什么低区更细（10% / 25% / 45% / 70%，而非五等分）：速度分布右偏，多数轮次落在
+ * 低比例区；等分会把大半轮次压进第一档，5 档退化成 3 档。阈值固定在这里，不随满格值
+ * 变化——满格值由 userConfig 决定，峰值超过时还会上浮，比例才是稳定的语义。</p>
+ *
+ * <p>配色取色相间隔最大的红→橙→绿→蓝→紫，并提高饱和度：早期的青绿与青蓝两档
+ * 色相只差 38°、饱和度也低，在 38%–48% 这种常见区间里肉眼几乎分不出差别。现在相邻
+ * 档最小色相间隔约 40°，且红与橙、绿与蓝的亮度差同时拉开，浅色与深色底上都可读。</p>
+ *
+ * <p>区间左闭右开，与其它分档函数保持同一比较口径。</p>
+ */
+const BAR_RATIO_TIERS: ReadonlyArray<{ readonly limit: number; readonly color: string }> = [
+  { limit: 0.1, color: '#E5484D' },
+  { limit: 0.25, color: '#F5A524' },
+  { limit: 0.45, color: '#17C964' },
+  { limit: 0.7, color: '#3B82F6' },
+  { limit: Number.POSITIVE_INFINITY, color: '#A855F7' },
+]
+
+/**
+ * 按「速度 / 满格刻度」返回所有速度读数的分档色。
+ *
+ * <p>比例先夹到 0–1：非正速度取下限，达到或超过满格取最高档，峰值上浮后不会出现
+ * 越界的负比例。满格刻度无效（≤0）时按最低档处理，保证调用方总能拿到可直接写进
+ * SVG 的十六进制色。阈值逐档比较，命中第一档即返回，档位数量变化时只需改
+ * {@link BAR_RATIO_TIERS}。</p>
+ */
+function barRatioColor(value: number, fullScale: number): string {
+  const ratio = fullScale > 0 ? Math.max(0, Math.min(1, value / fullScale)) : 0
+  for (const tier of BAR_RATIO_TIERS) {
+    if (ratio < tier.limit) return tier.color
+  }
+  return BAR_RATIO_TIERS[BAR_RATIO_TIERS.length - 1]?.color ?? '#A855F7'
 }
 
 /**
@@ -412,7 +453,7 @@ function speedBarsSvg(values: readonly number[], colors: readonly string[], widt
         fromEnd % indexStride === 0
           ? `<text x="${centerX.toFixed(1)}" y="${(height - 6).toFixed(1)}" text-anchor="middle" font-family="monospace" font-size="9" fill="${SVG_LABEL_COLOR}">${index + 1}</text>`
           : ''
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="2" fill="${colors[index] ?? '#3AAC85'}"/>${valueText}${indexText}`
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barHeight.toFixed(1)}" rx="2" fill="${colors[index] ?? '#17C964'}"/>${valueText}${indexText}`
     })
     .join('')
 
@@ -583,6 +624,21 @@ function applySpeedConfig(options: PluginOptions): void {
   }
   barFullScaleTps = DEFAULT_BAR_FULL_SCALE_TPS
   speedConfigIssue = `块条满格基准无效（${String(raw)}），已回退默认 ${DEFAULT_BAR_FULL_SCALE_TPS} t/s`
+}
+
+/**
+ * 任意速度读数的统一颜色：按「速度 / 满格刻度」取 {@link BAR_RATIO_TIERS} 的 5 档。
+ *
+ * <p>所有展示 tps 的位置共用这一个函数——顶部平均读数与档位标签、峰值/最低/最新指标
+ * 卡、趋势折线、每轮块条与同行读数、柱状图、会话视图的平均速度——同一读数在任何视图
+ * 里颜色一致，不再出现「速度视图一色、会话视图另一色」。</p>
+ *
+ * <p>基准取配置的满格刻度（{@link barFullScaleTps}），不随本轮峰值上浮：颜色表达的是
+ * 「离配置目标还有多远」，跨轮次、跨会话、跨视图都稳定。块条长度仍用上浮后的基准，
+ * 避免高负载会话全部顶格。无读数返回 undefined，交给宿主用默认前景色。</p>
+ */
+function speedColor(tps: number | null): string | undefined {
+  return tps === null ? undefined : barRatioColor(tps, barFullScaleTps)
 }
 
 /**
@@ -1744,7 +1800,8 @@ function registerUi(on: On): void {
       const values = recent.map(tpsOfRound).filter(v => v > 0)
       const peak = values.length > 0 ? Math.max(...values) : null
       const low = values.length > 0 ? Math.min(...values) : null
-      const level = tpsLevel(avg)
+      // 档位文本与颜色分开：文本是绝对区间，颜色统一按达成满格的比例取档。
+      const level = { label: tpsLabel(avg), color: speedColor(avg) }
       const model = latestRound
         ? clip(modelLabel(latestRound.model), Math.max(10, e.props.bodyColumns - 30))
         : '—'
@@ -1763,19 +1820,20 @@ function registerUi(on: On): void {
       // 刻度不被压缩，上界 1080 避免超宽面板把绘图区拉成细线。高度按宽度小幅补偿，视觉比例不失衡。
       const chartWidth = Math.min(1080, Math.max(540, Math.round(e.props.bodyColumns * 7.6)))
       const chartHeight = Math.min(190, Math.round(110 + (chartWidth - 540) * 0.08))
-      const chartSvg = showChart ? speedChartSvg(trend, level.color, chartWidth, chartHeight) : ''
-      // 宽面板柱状图（原有实现）：高度随宽度小幅补偿，柱色取每轮档位色。
+      const chartSvg = showChart ? speedChartSvg(trend, level.color ?? '#17C964', chartWidth, chartHeight) : ''
+      // 块条长度基准来自 userConfig（默认 300 t/s）：读数按绝对比例点亮，不同轮次、
+      // 不同会话的条长才可比。早前以本轮最大值为满格基准，171 t/s 就顶格，快慢差异
+      // 被压平。峰值超过基准时按实际峰值向上取整到 100 的倍数，避免全部顶格后再次
+      // 失去分辨率。这里只决定条长；颜色统一由 speedColor 按配置的满格刻度取档。
+      const barFullScale = Math.max(barFullScaleTps, Math.ceil((peak ?? 0) / 100) * 100)
+      // 宽面板柱状图（原有实现）：高度随宽度小幅补偿，柱色走 speedColor 的统一分档；
+      // 柱高仍按图表自身峰值自适应，保留分布分辨率。
       const barsHeight = Math.min(250, Math.round(160 + (chartWidth - 540) * 0.11))
-      const barColors = rows.map(round => tpsLevel(tpsOfRound(round)).color)
+      const barColors = rows.map(round => speedColor(tpsOfRound(round)) ?? '#17C964')
       const barsSvg = showChart ? speedBarsSvg(trend, barColors, chartWidth, barsHeight) : ''
       // 窄面板块条：序号 2 列 + 间距 + 数值 6 列，其余列给条；按 7px/列保守换算，
       // 宁可条略窄也不让整行越过面板宽度。数值省略 " t/s"，单位已在标题里标明。
       const narrowBarPx = Math.max(40, Math.round((e.props.bodyColumns - 10) * 7))
-      // 块条满格基准来自 userConfig（默认 300 t/s）：读数按绝对比例点亮，不同轮次、
-      // 不同会话的条长才可比。早前以本轮最大值为满格基准，171 t/s 就顶格，快慢差异
-      // 被压平。峰值超过基准时按实际峰值向上取整到 100 的倍数，避免全部顶格后再次
-      // 失去分辨率。
-      const barFullScale = Math.max(barFullScaleTps, Math.ceil((peak ?? 0) / 100) * 100)
 
       return (
         <Box flexDirection="column" gap={1}>
@@ -1789,7 +1847,7 @@ function registerUi(on: On): void {
             <Text color={level.color} size="caption">{level.label}</Text>
             <Text dimColor size="caption">· {model}</Text>
           </Box>
-          {/* 趋势折线：网格与刻度中性灰，折线与面积用当前档位色；无数据时不绘制。 */}
+          {/* 趋势折线：网格与刻度中性灰，折线与面积用平均速度的统一色；无数据时不绘制。 */}
           {chartSvg !== '' && SvgTag !== null && (
             <SvgTag
               source={chartSvg}
@@ -1798,19 +1856,19 @@ function registerUi(on: On): void {
               height={chartHeight}
             />
           )}
-          {/* 峰值/最低/最新并列一行，三个数值统一按自身速度档位着色，与下方轮次条共用
-              同一套颜色语义：同一读数在指标行和图表里必须是同一个颜色。 */}
+          {/* 峰值/最低/最新并列一行，三个数值与下方轮次条、会话视图共用 speedColor 的
+              统一分档：同一读数在指标行、图表和别的视图里必须是同一个颜色。 */}
           <Box flexDirection="row" gap={2}>
-            {compactMetric('峰值', peak === null ? '—' : peak.toFixed(1), tpsLevel(peak).color)}
-            {compactMetric('最低', low === null ? '—' : low.toFixed(1), tpsLevel(low).color)}
-            {compactMetric('最新', latest === null ? '—' : latest.toFixed(1), tpsLevel(latest).color)}
+            {compactMetric('峰值', peak === null ? '—' : peak.toFixed(1), speedColor(peak))}
+            {compactMetric('最低', low === null ? '—' : low.toFixed(1), speedColor(low))}
+            {compactMetric('最新', latest === null ? '—' : latest.toFixed(1), speedColor(latest))}
           </Box>
           {rows.length === 0 ? (
             <Text dimColor size="caption">还没有完成的轮次</Text>
           ) : showChart && SvgTag !== null ? (
             // 宽面板保留垂直柱状图：柱顶有数值、底部有轮次序号、左侧有刻度。
             <Box flexDirection="column" gap={1}>
-              <Text size="caption" weight="bold">最近 {rows.length} 轮生成速度（t/s）</Text>
+              <Text size="caption" weight="bold">最近 {rows.length} 轮生成速度（t/s）· 满格 {barFullScaleTps}</Text>
               <SvgTag
                 source={barsSvg}
                 alt={`最近 ${rows.length} 轮生成速度柱状图，峰值 ${peak === null ? '—' : peak.toFixed(1)} t/s`}
@@ -1824,15 +1882,17 @@ function registerUi(on: On): void {
               <Text dimColor size="caption">最近 {rows.length} 轮生成速度</Text>
               {rows.map((round, index) => {
                 const tps = tpsOfRound(round)
-                const roundLevel = tpsLevel(tps)
+                // 字符条按图表峰值比长度，颜色仍走 speedColor 的统一分档；
+                // 终端是降级路径，颜色一致性优先于长度与颜色的同源。
+                const ratioColor = speedColor(tps)
                 const width = Math.max(1, Math.round((tps / maxTps) * barMax))
                 return (
                   <Box key={round.turnId} flexDirection="row">
                     <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')} </Text>
                     <Box width={barMax}>
-                      <Text color={roundLevel.color}>{'█'.repeat(width)}</Text>
+                      <Text color={ratioColor}>{'█'.repeat(width)}</Text>
                     </Box>
-                    <Text color={roundLevel.color}> {tps.toFixed(1)} t/s</Text>
+                    <Text color={ratioColor}> {tps.toFixed(1)} t/s</Text>
                   </Box>
                 )
               })}
@@ -1841,24 +1901,25 @@ function registerUi(on: On): void {
             // 窄面板用分格块条：序号与速率交给宿主 Text 排版，SVG 只画格子；三段各占一列，
             // 字体度量再大也不会压住数字。数值省略单位；标题与图表之间用 marginTop 留一行间距。
             <Box flexDirection="column">
-              <Text size="caption" weight="bold">最近 {narrowRows.length} 轮生成速度（t/s）</Text>
+              <Text size="caption" weight="bold">最近 {narrowRows.length} 轮生成速度（t/s）· 满格 {barFullScaleTps}</Text>
               <Box flexDirection="column" marginTop={1}>
                 {narrowRows.map((round, index) => {
                   const tps = tpsOfRound(round)
-                  const roundLevel = tpsLevel(tps)
+                  // 块条与右侧读数共用统一分档色：条越长颜色越冷，一行之内不出现两套颜色。
+                  const ratioColor = speedColor(tps)
                   return (
                     <Box key={round.turnId} flexDirection="row" alignItems="center" gap={1}>
                       <Box width={2}>
                         <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')}</Text>
                       </Box>
                       <SvgTag
-                        source={speedBarRowSvg(tps, barFullScale, roundLevel.color, narrowBarPx, 10)}
+                        source={speedBarRowSvg(tps, barFullScale, ratioColor ?? '#17C964', narrowBarPx, 10)}
                         alt={`第 ${index + 1} 轮生成速度 ${tps.toFixed(1)} t/s`}
                         width={narrowBarPx}
                         height={10}
                       />
                       <Box width={6} justifyContent="flex-end">
-                        <Text color={roundLevel.color} size="caption">{tps.toFixed(1)}</Text>
+                        <Text color={ratioColor} size="caption">{tps.toFixed(1)}</Text>
                       </Box>
                     </Box>
                   )
@@ -2078,7 +2139,7 @@ function registerUi(on: On): void {
                   <Box flexDirection="column" flexGrow={1}>
                     {kvRow('请求次数', String(display.requests))}
                     {kvRow('轮数', String(display.turns))}
-                    {kvRow('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, tpsLevel(avgTps).color)}
+                    {kvRow('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, speedColor(avgTps))}
                   </Box>
                   <Box flexDirection="column" flexGrow={1}>
                     {kvRow('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—', tierColor(display.turns > 0 ? avgDuration : null, DURATION_BOUNDS_MS))}
@@ -2091,7 +2152,7 @@ function registerUi(on: On): void {
                   {kvRow('轮数', String(display.turns))}
                   {kvRow('平均耗时', display.turns > 0 ? `${(avgDuration / 1000).toFixed(1)}s` : '—', tierColor(display.turns > 0 ? avgDuration : null, DURATION_BOUNDS_MS))}
                   {kvRow('平均延迟', display.ttftCount > 0 ? `${(avgTtft / 1000).toFixed(1)}s` : '—', latencyColor(display.ttftCount > 0 ? avgTtft : null))}
-                  {kvRow('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, tpsLevel(avgTps).color)}
+                  {kvRow('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, speedColor(avgTps))}
                 </Box>
               )}
             </Box>
@@ -2290,7 +2351,7 @@ function registerUi(on: On): void {
                 {metric('缓存率', agentCacheRate === null ? '—' : `${agentCacheRate.toFixed(1)}%`, cacheRateLevel(agentCacheRate))}
                 {metric('请求次数', String(requests))}
                 {metric('轮数', String(turns))}
-                {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`)}
+                {metric('平均速度', avgTps === null ? '—' : `${avgTps.toFixed(1)} t/s`, speedColor(avgTps))}
                 {metric('估算费用', `$${agentUsage.cost.toFixed(2)}`)}
               </Box>
               <Text dimColor size="caption">任务列表</Text>
@@ -2329,7 +2390,7 @@ function registerUi(on: On): void {
                       </Box>
                       <Box flexDirection="row" gap={2} flexWrap="wrap">
                         {compactMetric('请求', String(counted?.requests ?? 0))}
-                        {compactMetric('速度', speed === null ? '—' : `${speed.toFixed(1)} t/s`)}
+                        {compactMetric('速度', speed === null ? '—' : `${speed.toFixed(1)} t/s`, speedColor(speed))}
                       </Box>
                     </Box>
                   )
