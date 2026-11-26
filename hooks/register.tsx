@@ -1837,34 +1837,42 @@ function registerUi(on: On): void {
         ? clip(modelLabel(latestRound.model), Math.max(10, e.props.bodyColumns - 30))
         : '—'
       const rows = recent
-      // 窄面板块条每轮一行、纵向不受画布宽度限制，展示最近 50 轮完整历史；
-      // 宽面板柱状图受柱宽与柱顶数值限制，仍用上面的 rows。
-      const narrowRows = list.slice(-50)
+      // 块条每轮一行、纵向不受画布宽度限制：宽面板与折线、柱状图共用最近 20 轮窗口，
+      // 窄面板展示最近 50 轮完整历史。
+      const barRows = wide ? rows : list.slice(-50)
       const maxTps = peak ?? 1
       // 条形区按面板可用列数分配，并给编号和数值留固定列，保证纵向扫读时数字对齐。
       const barMax = Math.max(6, e.props.bodyColumns - 20)
-      // 折线画在条形图上方：只用基础 SVG 图元，面板足够宽且至少 2 轮时才绘制，
-      // 窄侧栏或终端退回条形图，不出现半截图。
+      // 折线画在明细图上方：只用基础 SVG 图元，面板足够宽且至少 2 轮时才绘制；
+      // 窄侧栏与终端不画折线，只保留块条或字符条，不出现半截图。
       const trend = rows.map(tpsOfRound)
       const showChart = wide && trend.length >= 2
       // 图表像素宽度随面板列数增长：每列按 7.6px 保守估算（宁可略窄也不越过槽位），下界 540 保持窄面板
-      // 刻度不被压缩，上界 1080 避免超宽面板把绘图区拉成细线。高度按宽度小幅补偿，视觉比例不失衡。
+      // 刻度不被压缩，上界 1080 避免超宽面板把绘图区拉成细线。
       const chartWidth = Math.min(1080, Math.max(540, Math.round(e.props.bodyColumns * 7.6)))
-      const chartHeight = Math.min(190, Math.round(110 + (chartWidth - 540) * 0.08))
+      // 高度按宽度比例分配：侧栏面板通常远高于内容，早期固定 110/160px 会在下方留下大片空白。
+      // 折线约取宽度的 37%，柱状图约取 56%，并设上下限避免窄面板压扁、超宽面板拉得过长。
+      const chartHeight = Math.min(260, Math.max(110, Math.round(chartWidth * 0.37)))
       const chartSvg = showChart ? speedChartSvg(trend, level.color ?? '#17C964', chartWidth, chartHeight) : ''
       // 块条长度基准来自 userConfig（默认 300 t/s）：读数按绝对比例点亮，不同轮次、
       // 不同会话的条长才可比。早前以本轮最大值为满格基准，171 t/s 就顶格，快慢差异
       // 被压平。峰值超过基准时按实际峰值向上取整到 100 的倍数，避免全部顶格后再次
       // 失去分辨率。这里只决定条长；颜色统一由 speedColor 按配置的满格刻度取档。
       const barFullScale = Math.max(barFullScaleTps, Math.ceil((peak ?? 0) / 100) * 100)
-      // 宽面板柱状图（原有实现）：高度随宽度小幅补偿，柱色走 speedColor 的统一分档；
+      // 宽面板柱状图：高度与折线图同口径放大，柱色走 speedColor 的统一分档；
       // 柱高仍按图表自身峰值自适应，保留分布分辨率。
-      const barsHeight = Math.min(250, Math.round(160 + (chartWidth - 540) * 0.11))
+      const barsHeight = Math.min(360, Math.max(160, Math.round(chartWidth * 0.56)))
       const barColors = rows.map(round => speedColor(tpsOfRound(round)) ?? '#17C964')
       const barsSvg = showChart ? speedBarsSvg(trend, barColors, chartWidth, barsHeight) : ''
-      // 窄面板块条：序号 2 列 + 间距 + 数值 6 列，其余列给条；按 7px/列保守换算，
-      // 宁可条略窄也不让整行越过面板宽度。数值省略 " t/s"，单位已在标题里标明。
-      const narrowBarPx = Math.max(40, Math.round((e.props.bodyColumns - 10) * 7))
+      // 窄面板块条：序号 2 列 + 两个间距 + 数值列，其余列给条；按 7.6px/列换算，与图表
+      // 宽度同一口径。数值列按本轮读数的实际字符数取 4–6 列：常规 5 字符时条能多占约
+      // 10%，出现 1000 t/s 以上的 6 字符读数时自动让出一列，避免换行破坏行高。
+      // 数值省略 " t/s"，单位已在标题里标明。
+      const valueCols = Math.max(
+        4,
+        Math.min(6, barRows.reduce((n, round) => Math.max(n, tpsOfRound(round).toFixed(1).length), 3)),
+      )
+      const barRowPx = Math.max(40, Math.round((e.props.bodyColumns - (4 + valueCols)) * 7.6))
 
       return (
         <Box flexDirection="column" gap={1}>
@@ -1878,14 +1886,19 @@ function registerUi(on: On): void {
             <Text color={level.color} size="caption">{level.label}</Text>
             <Text dimColor size="caption">· {model}</Text>
           </Box>
-          {/* 趋势折线：网格与刻度中性灰，折线与面积用平均速度的统一色；无数据时不绘制。 */}
+          {/* 趋势折线：网格与刻度中性灰，折线与面积用平均速度的统一色；无数据时不绘制。
+              标题与说明各占一行，读者不用猜这张图看什么。 */}
           {chartSvg !== '' && SvgTag !== null && (
-            <SvgTag
-              source={chartSvg}
-              alt={`最近 ${trend.length} 轮生成速度趋势，最新 ${latest === null ? '—' : latest.toFixed(1)} t/s`}
-              width={chartWidth}
-              height={chartHeight}
-            />
+            <Box flexDirection="column">
+              <Text size="caption" weight="bold">速度趋势</Text>
+              <Text dimColor size="caption">面积层表示相对高低，末端标注最新读数</Text>
+              <SvgTag
+                source={chartSvg}
+                alt={`最近 ${trend.length} 轮生成速度趋势，最新 ${latest === null ? '—' : latest.toFixed(1)} t/s`}
+                width={chartWidth}
+                height={chartHeight}
+              />
+            </Box>
           )}
           {/* 峰值/最低/最新并列一行，三个数值与下方轮次条、会话视图共用 speedColor 的
               统一分档：同一读数在指标行、图表和别的视图里必须是同一个颜色。 */}
@@ -1896,66 +1909,82 @@ function registerUi(on: On): void {
           </Box>
           {rows.length === 0 ? (
             <Text dimColor size="caption">还没有完成的轮次</Text>
-          ) : showChart && SvgTag !== null ? (
-            // 宽面板保留垂直柱状图：柱顶有数值、底部有轮次序号、左侧有刻度。
-            <Box flexDirection="column" gap={1}>
-              <Text size="caption" weight="bold">最近 {rows.length} 轮生成速度（t/s）· 满格 {barFullScaleTps}</Text>
-              <SvgTag
-                source={barsSvg}
-                alt={`最近 ${rows.length} 轮生成速度柱状图，峰值 ${peak === null ? '—' : peak.toFixed(1)} t/s`}
-                width={chartWidth}
-                height={barsHeight}
-              />
-            </Box>
-          ) : SvgTag === null ? (
-            // 终端没有 Svg 元素：退回字符条，保证每轮都有可读的数值。
-            <Box flexDirection="column">
-              <Text dimColor size="caption">最近 {rows.length} 轮生成速度</Text>
-              {rows.map((round, index) => {
-                const tps = tpsOfRound(round)
-                // 字符条按图表峰值比长度，颜色仍走 speedColor 的统一分档；
-                // 终端是降级路径，颜色一致性优先于长度与颜色的同源。
-                const ratioColor = speedColor(tps)
-                const width = Math.max(1, Math.round((tps / maxTps) * barMax))
-                return (
-                  <Box key={round.turnId} flexDirection="row">
-                    <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')} </Text>
-                    <Box width={barMax}>
-                      <Text color={ratioColor}>{'█'.repeat(width)}</Text>
-                    </Box>
-                    <Text color={ratioColor}> {tps.toFixed(1)} t/s</Text>
-                  </Box>
-                )
-              })}
-            </Box>
           ) : (
-            // 窄面板用分格块条：序号与速率交给宿主 Text 排版，SVG 只画格子；三段各占一列，
-            // 字体度量再大也不会压住数字。数值省略单位；标题与图表之间用 marginTop 留一行间距。
-            <Box flexDirection="column">
-              <Text size="caption" weight="bold">最近 {narrowRows.length} 轮生成速度（t/s）· 满格 {barFullScaleTps}</Text>
-              <Box flexDirection="column" marginTop={1}>
-                {narrowRows.map((round, index) => {
-                  const tps = tpsOfRound(round)
-                  // 块条与右侧读数共用统一分档色：条越长颜色越冷，一行之内不出现两套颜色。
-                  const ratioColor = speedColor(tps)
-                  return (
-                    <Box key={round.turnId} flexDirection="row" alignItems="center" gap={1}>
-                      <Box width={2}>
-                        <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')}</Text>
+            <Box flexDirection="column" gap={1}>
+              {showChart && SvgTag !== null && (
+                // 宽面板保留垂直柱状图：柱顶有数值、底部有轮次序号、左侧有刻度。
+                <Box flexDirection="column" gap={1}>
+                  <Box flexDirection="column">
+                    <Text size="caption" weight="bold">逐轮柱状图</Text>
+                    <Text dimColor size="caption">
+                      最近 {rows.length} 轮 · 柱高按本轮峰值自适应，柱顶为精确读数，颜色按满格 {barFullScaleTps} 比例分 5 档
+                    </Text>
+                  </Box>
+                  <SvgTag
+                    source={barsSvg}
+                    alt={`最近 ${rows.length} 轮生成速度柱状图，峰值 ${peak === null ? '—' : peak.toFixed(1)} t/s`}
+                    width={chartWidth}
+                    height={barsHeight}
+                  />
+                </Box>
+              )}
+              {SvgTag === null ? (
+                // 终端没有 Svg 元素：退回字符条，保证每轮都有可读的数值。
+                <Box flexDirection="column">
+                  <Text dimColor size="caption">最近 {rows.length} 轮生成速度</Text>
+                  {rows.map((round, index) => {
+                    const tps = tpsOfRound(round)
+                    // 字符条按图表峰值比长度，颜色仍走 speedColor 的统一分档；
+                    // 终端是降级路径，颜色一致性优先于长度与颜色的同源。
+                    const ratioColor = speedColor(tps)
+                    const width = Math.max(1, Math.round((tps / maxTps) * barMax))
+                    return (
+                      <Box key={round.turnId} flexDirection="row">
+                        <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')} </Text>
+                        <Box width={barMax}>
+                          <Text color={ratioColor}>{'█'.repeat(width)}</Text>
+                        </Box>
+                        <Text color={ratioColor}> {tps.toFixed(1)} t/s</Text>
                       </Box>
-                      <SvgTag
-                        source={speedBarRowSvg(tps, barFullScale, ratioColor ?? '#17C964', narrowBarPx, 10)}
-                        alt={`第 ${index + 1} 轮生成速度 ${tps.toFixed(1)} t/s`}
-                        width={narrowBarPx}
-                        height={10}
-                      />
-                      <Box width={6} justifyContent="flex-end">
-                        <Text color={ratioColor} size="caption">{tps.toFixed(1)}</Text>
-                      </Box>
-                    </Box>
-                  )
-                })}
-              </Box>
+                    )
+                  })}
+                </Box>
+              ) : (
+                // 分格块条：序号与速率交给宿主 Text 排版，SVG 只画格子；三段各占一列，
+                // 字体度量再大也不会压住数字。宽面板与上方图表同窗口（20 轮），窄面板
+                // 展示 50 轮；标题与说明各占一行，满格基准写在说明里。数值省略 " t/s"。
+                <Box flexDirection="column">
+                  <Box flexDirection="column">
+                    <Text size="caption" weight="bold">逐轮明细</Text>
+                    <Text dimColor size="caption">
+                      最近 {barRows.length} 轮 · 条长按满格 {barFullScaleTps} t/s 比例，末格按比例部分填充
+                    </Text>
+                  </Box>
+                  <Box flexDirection="column" marginTop={1}>
+                    {barRows.map((round, index) => {
+                      const tps = tpsOfRound(round)
+                      // 块条与右侧读数共用统一分档色：条越长颜色越冷，一行之内不出现两套颜色。
+                      const ratioColor = speedColor(tps)
+                      return (
+                        <Box key={round.turnId} flexDirection="row" alignItems="center" gap={1}>
+                          <Box width={2}>
+                            <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')}</Text>
+                          </Box>
+                          <SvgTag
+                            source={speedBarRowSvg(tps, barFullScale, ratioColor ?? '#17C964', barRowPx, 10)}
+                            alt={`第 ${index + 1} 轮生成速度 ${tps.toFixed(1)} t/s`}
+                            width={barRowPx}
+                            height={10}
+                          />
+                          <Box width={valueCols} justifyContent="flex-end">
+                            <Text color={ratioColor} size="caption">{tps.toFixed(1)}</Text>
+                          </Box>
+                        </Box>
+                      )
+                    })}
+                  </Box>
+                </Box>
+              )}
             </Box>
           )}
         </Box>

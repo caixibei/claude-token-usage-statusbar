@@ -1,6 +1,6 @@
 # 📊 usage-toolbar
 
-[![Version](https://img.shields.io/badge/version-0.2.50-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.2.53-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Claude%20Desktop%20%7C%20Claude%20Code-6f42c1?style=flat-square)
 ![Type](https://img.shields.io/badge/type-Claude%20mod-ff8c00?style=flat-square)
@@ -52,12 +52,15 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：⚡ 实时生成�
 
 #### ⚡ 速度：最近轮次的输出速度
 
-![速度视图：最近 18 轮平均输出速度折线、峰值/最低/最新读数，以及按统一分档着色的最近 12 轮柱状图](assets/panel-speed.png)
+![速度视图：最近 18 轮平均输出速度折线、峰值/最低/最新读数，以及按统一分档着色的柱状图与逐轮块条](assets/panel-speed.png)
 
 - 顶部直接给出当前会话最近轮次的平均输出速度、绝对速度档位（如 `70-150`）与模型
+- 三张图各自带标题与一行说明：速度趋势（折线）、逐轮柱状图、逐轮明细（块条），不用猜每张图看什么
 - 折线图展示逐轮趋势，峰值、最低、最新三项读数标在下方，一眼看出波动
-- 柱状图与窄面板块条按「速度 / 满格刻度」分 5 档着色：条长和颜色表达同一个达成度，越接近满格颜色越冷，不需要逐条读数
-- 标题标出当前满格刻度（如 `满格 300`）；桌面端用 SVG 绘制，终端回退字符柱状图；速度是字符估算值，真实值在每步或每轮结束时回填
+- 宽面板同时显示柱状图与逐轮块条（同一窗口 20 轮）；窄面板只显示块条（最近 50 轮）
+- 柱状图与块条按「速度 / 满格刻度」分 5 档着色：条长和颜色表达同一个达成度，越接近满格颜色越冷
+- 块条整格实心、末格按比例部分填充，相近读数也能看出差别；柱状图标题标出满格刻度
+- 桌面端用 SVG 绘制，终端回退字符柱状图；速度是字符估算值，真实值在每步或每轮结束时回填
 
 #### ✨ 增强：改写记录逐条可查
 
