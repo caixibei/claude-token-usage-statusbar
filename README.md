@@ -1,6 +1,6 @@
 # 📊 usage-toolbar
 
-[![Version](https://img.shields.io/badge/version-0.2.49-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.2.50-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Claude%20Desktop%20%7C%20Claude%20Code-6f42c1?style=flat-square)
 ![Type](https://img.shields.io/badge/type-Claude%20mod-ff8c00?style=flat-square)

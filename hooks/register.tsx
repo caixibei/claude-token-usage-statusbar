@@ -324,10 +324,13 @@ function svgColor(color: string | undefined, fallback: string): string {
 }
 
 /**
- * 上下文占比水位条：10 个独立圆角方块，按百分比填充前 N 个。
+ * 上下文占比水位条：10 个独立圆角方块，按百分比填充。
  *
  * <p>与设计稿一致的方块阵列：每格 6×8px、间隙 2px、圆角 1.5px，未填充格用浅灰轨色。
- * 字符水位条（{@code █} / {@code ░}）在桌面端会渲染成受字距影响的小方块与点阵噪声，
+ * 整格实心，最后一格按剩余比例缩短宽度，40% 与 43% 这类相邻读数也能看出差别；极小
+ * 占比至少保留 1px 着色，避免看起来是空条。</p>
+ *
+ * <p>字符水位条（{@code █} / {@code ░}）在桌面端会渲染成受字距影响的小方块与点阵噪声，
  * 因此桌面端改用 SVG 精确绘制；终端 surface 没有 Svg 元素，仍由字符水位条兜底。</p>
  */
 function contextBarSvg(percent: number, fill: string): string {
@@ -337,14 +340,27 @@ function contextBarSvg(percent: number, fill: string): string {
   const height = 8
   const radius = 1.5
   const totalWidth = cells * cellWidth + (cells - 1) * gap
-  const filled = Math.max(0, Math.min(cells, Math.round((percent / 100) * cells)))
+  // 精确格数保留小数：整格实心，最后一格按剩余比例裁短宽度。
+  const exact = Math.max(0, Math.min(cells, (percent / 100) * cells))
+  const fullCells = Math.floor(exact)
+  const partial = exact - fullCells
   const parts = [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="${height}" viewBox="0 0 ${totalWidth} ${height}">`,
   ]
   for (let i = 0; i < cells; i += 1) {
-    parts.push(
-      `<rect x="${i * (cellWidth + gap)}" y="0" width="${cellWidth}" height="${height}" rx="${radius}" fill="${i < filled ? fill : '#CECCCE'}"/>`,
-    )
+    const x = i * (cellWidth + gap)
+    if (i < fullCells) {
+      parts.push(`<rect x="${x}" y="0" width="${cellWidth}" height="${height}" rx="${radius}" fill="${fill}"/>`)
+      continue
+    }
+    // 未填充格先铺轨色；部分格在轨色之上叠加实心块，与速度块条共用「格内进度」画法。
+    parts.push(`<rect x="${x}" y="0" width="${cellWidth}" height="${height}" rx="${radius}" fill="#CECCCE"/>`)
+    if (i === fullCells && partial > 0) {
+      const partialW = Math.max(1, cellWidth * partial)
+      parts.push(
+        `<rect x="${x}" y="0" width="${partialW.toFixed(1)}" height="${height}" rx="${Math.min(radius, partialW / 2).toFixed(1)}" fill="${fill}"/>`,
+      )
+    }
   }
   parts.push('</svg>')
   return parts.join('')
