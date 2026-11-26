@@ -467,21 +467,36 @@ function speedBarsSvg(values: readonly number[], colors: readonly string[], widt
  * SVG 会被放大并向左撑进条区，同时与相邻行产生半行错位。因此 SVG 只负责格子，文字交给
  * 宿主的 Text 组件排版，两者在 flex 行内各占一列，任何字体度量都不会相交。</p>
  *
- * <p>格子按 value / maxValue 的比例点亮，非零值至少一格；格数按宽度推导（约 16px 一格，
+ * <p>格子按 value / maxValue 的比例点亮：整格实心，最后一格按剩余比例缩短宽度，读数相差
+ * 不到一格也能看出差别——早期整格四舍五入，96.4 与 88.5 这类相邻读数会被画成同样长度。
+ * 非零值至少保留 1px 着色，避免极低速度看起来是空条。格数按宽度推导（约 16px 一格，
  * 限制在 8–40 格），单格宽度 = 步距 - 3px 间隙。调用方保证 width ≥ 160。</p>
  */
 function speedBarRowSvg(value: number, maxValue: number, color: string, width: number, height: number): string {
   const cells = Math.max(8, Math.min(40, Math.floor(width / 16)))
   const pitch = width / cells
   const cellW = Math.max(2, pitch - 3)
-  const lit = value <= 0 ? 0 : Math.max(1, Math.min(cells, Math.round((value / maxValue) * cells)))
+  // 精确格数保留小数：整格实心，最后一格按剩余比例裁短宽度。
+  const exact = value > 0 && maxValue > 0 ? Math.max(0, Math.min(cells, (value / maxValue) * cells)) : 0
+  const fullCells = Math.floor(exact)
+  const partial = exact - fullCells
   const parts = [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">`,
   ]
   for (let i = 0; i < cells; i += 1) {
-    parts.push(
-      `<rect x="${(i * pitch).toFixed(1)}" y="0" width="${cellW.toFixed(1)}" height="${height}" rx="1.5" fill="${i < lit ? color : '#CECCCE'}"/>`,
-    )
+    const x = (i * pitch).toFixed(1)
+    if (i < fullCells) {
+      parts.push(`<rect x="${x}" y="0" width="${cellW.toFixed(1)}" height="${height}" rx="1.5" fill="${color}"/>`)
+      continue
+    }
+    // 未填充格先铺轨色；部分格在轨色之上叠加实心块，形成「格内进度」。
+    parts.push(`<rect x="${x}" y="0" width="${cellW.toFixed(1)}" height="${height}" rx="1.5" fill="#CECCCE"/>`)
+    if (i === fullCells && partial > 0) {
+      const partialW = Math.max(1, cellW * partial)
+      parts.push(
+        `<rect x="${x}" y="0" width="${partialW.toFixed(1)}" height="${height}" rx="${Math.min(1.5, partialW / 2).toFixed(1)}" fill="${color}"/>`,
+      )
+    }
   }
   parts.push('</svg>')
   return parts.join('')
