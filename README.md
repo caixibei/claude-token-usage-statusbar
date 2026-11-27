@@ -1,6 +1,6 @@
 # 📊 usage-toolbar
 
-[![Version](https://img.shields.io/badge/version-0.2.57-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.2.58-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Claude%20Desktop%20%7C%20Claude%20Code-6f42c1?style=flat-square)
 ![Type](https://img.shields.io/badge/type-Claude%20mod-ff8c00?style=flat-square)
@@ -58,7 +58,7 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：⚡ 实时生成�
 - 三张图各自带标题与一行说明：速度趋势（折线）、逐请求柱状图、逐请求明细（块条），不用猜每张图看什么
 - 折线图展示逐个请求的速度趋势，峰值、最低、最新三项读数标在下方，一眼看出波动
 - 宽面板按最近 N 个模型请求展示三张图（N 由「宽面板请求窗口」配置，默认 20），只统计主会话请求，子代理请求不计入
-- 窄面板没有图表空间，仍按轮次展示最近 50 轮的块条；重启或 rewind 后请求读数还没产生时，宽面板自动回退到轮次口径，不会空着
+- 窄面板没有图表空间，仍按轮次展示最近 50 轮的块条；重启或 rewind 后请求读数不足 3 条时，宽面板自动回退到轮次口径，标题标注「（请求积累中 N/3）」，攒够 3 条再切回请求级
 - 柱状图与块条按「速度 / 满格刻度」分 5 档着色：条长和颜色表达同一个达成度，越接近满格颜色越冷
 - 块条整格实心、末格按比例部分填充，相近读数也能看出差别；柱状图标题标出满格刻度
 - 桌面端用 SVG 绘制，终端回退字符柱状图；速度是字符估算值，真实值在每步或每轮结束时回填

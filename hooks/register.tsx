@@ -642,6 +642,11 @@ const DEFAULT_LATENCY_BOUNDS_SEC: TierBounds = [2, 4, 8]
 const DEFAULT_BAR_FULL_SCALE_TPS = 300
 /** 宽面板请求窗口的默认个数；可由 userConfig 的 recentRequestWindow 覆盖。 */
 const DEFAULT_REQUEST_WINDOW = 20
+/**
+ * 请求级展示的最少条数：少于该值时宽面板继续用轮次口径，并在标题标注积累进度。
+ * 1–2 根柱子看不出分布，也容易与轮级读数混淆；窗口配置更小时按窗口值取，避免切不过去。
+ */
+const REQUEST_MIN_POINTS = 3
 /** 请求读数在状态里保留的条数上限：展示窗口从尾部截取，留出调大窗口的余量。 */
 const REQUEST_KEEP = 200
 
@@ -2010,7 +2015,8 @@ function registerUi(on: On): void {
       // 面板够宽才画图表：请求/轮次各占一列。窄面板与终端按轮次，纵向铺开 50 轮。
       const wide = e.surface !== 'terminal' && e.props.bodyColumns >= 64
       // 宽面板取最近 N 个请求（N 来自 userConfig，默认 20，上限 200）；只含主会话请求，
-      // 子代理请求不进本数组。不落库，重启或 rewind 后为空时回退轮次，避免三张图空着。
+      // 子代理请求不进本数组。不落库，重启或 rewind 后不足 REQUEST_MIN_POINTS 条时回退
+      // 轮次，避免三张图空着或只剩一两根柱子；标题会标注积累进度。
       const requestPoints: SpeedPoint[] = wide
         ? requestList.slice(-requestWindow).map(item => ({
             key: `${item.turnId}:${item.index}`,
@@ -2020,7 +2026,10 @@ function registerUi(on: On): void {
             genMs: item.genMs,
           }))
         : []
-      const useRequests = requestPoints.length > 0
+      // 请求级至少攒够 REQUEST_MIN_POINTS 条才切换；窗口配置更小时按窗口取，
+      // 否则窗口设成 1–2 会永远停在轮级。
+      const requestMinPoints = Math.min(REQUEST_MIN_POINTS, requestWindow)
+      const useRequests = requestPoints.length >= requestMinPoints
       // 回退轮次时宽面板与折线共用 20 轮窗口；窄面板展示最近 50 轮。
       const roundPoints: SpeedPoint[] = useRequests
         ? []
@@ -2098,7 +2107,7 @@ function registerUi(on: On): void {
 
       return (
         <Box flexDirection="column" gap={1}>
-          <Text dimColor size="caption">当前会话 · 最近 {points.length} {granularity}平均输出速度</Text>
+          <Text dimColor size="caption">当前会话 · 最近 {points.length} {granularity}平均输出速度{wide && !useRequests ? `（请求积累中 ${requestPoints.length}/${requestMinPoints}）` : ''}</Text>
           {/* 主数值独占一行，单位用小字；档位与模型另起一行，避免挤在一起。 */}
           <Box flexDirection="row" alignItems="flex-end" gap={1}>
             <Text color={level.color} size="heading">
