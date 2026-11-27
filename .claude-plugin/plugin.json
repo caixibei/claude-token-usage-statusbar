@@ -1,6 +1,6 @@
 {
   "name": "usage-toolbar",
-  "version": "0.2.58",
+  "version": "0.2.59",
   "description": "Claude Desktop 用量与提示词增强：实时生成速度、首字延迟、会话累计、子代理统计、上下文水位与提示词改写。",
   "author": { "name": "蔡熙贝" },
   "license": "MIT",

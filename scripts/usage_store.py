@@ -15,6 +15,9 @@ DB_DIR = os.path.join(os.path.expanduser("~"), ".claude", "usage-toolbar")
 DB_PATH = os.path.join(DB_DIR, "usage.db")
 KEEP_SESSIONS = 20
 MAX_ROUNDS_PER_SESSION = 100
+# 每个会话保留的请求级读数上限：宽面板按请求展示速度，需要跨重启回填；
+# 500 条约覆盖 20–50 轮，足以填满默认 20 个请求的展示窗口并留出调大余量。
+MAX_REQUESTS_PER_SESSION = 500
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -45,6 +48,7 @@ CREATE TABLE IF NOT EXISTS rounds (
   cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
   duration_ms INTEGER NOT NULL DEFAULT 0,
   gen_ms INTEGER NOT NULL DEFAULT 0,
+  gen_pure_ms INTEGER,
   ttft_ms INTEGER,
   started_at INTEGER NOT NULL,
   PRIMARY KEY (session_id, turn_id)
@@ -52,6 +56,25 @@ CREATE TABLE IF NOT EXISTS rounds (
 
 CREATE INDEX IF NOT EXISTS idx_rounds_session_started
   ON rounds(session_id, started_at);
+
+CREATE TABLE IF NOT EXISTS requests (
+  session_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  step_index INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  gen_ms INTEGER NOT NULL DEFAULT 0,
+  gen_pure_ms INTEGER,
+  ttft_ms INTEGER,
+  started_at INTEGER NOT NULL,
+  PRIMARY KEY (session_id, turn_id, step_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_requests_session_started
+  ON requests(session_id, started_at);
 """
 
 
@@ -66,6 +89,12 @@ def connect():
         conn.execute("ALTER TABLE sessions ADD COLUMN by_model TEXT NOT NULL DEFAULT '{}'")
     if "agent_totals" not in columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN agent_totals TEXT NOT NULL DEFAULT '{}'")
+    request_columns = [row[1] for row in conn.execute("PRAGMA table_info(requests)")]
+    if "gen_pure_ms" not in request_columns:
+        conn.execute("ALTER TABLE requests ADD COLUMN gen_pure_ms INTEGER")
+    round_columns = [row[1] for row in conn.execute("PRAGMA table_info(rounds)")]
+    if "gen_pure_ms" not in round_columns:
+        conn.execute("ALTER TABLE rounds ADD COLUMN gen_pure_ms INTEGER")
     return conn
 
 
@@ -93,6 +122,7 @@ def save(payload):
 
     totals = payload.get("totals") or {}
     rounds = (payload.get("rounds") or [])[-MAX_ROUNDS_PER_SESSION:]
+    requests = (payload.get("requests") or [])[-MAX_REQUESTS_PER_SESSION:]
     updated_at = as_int(payload.get("updatedAt"), int(time.time() * 1000))
 
     conn = connect()
@@ -146,8 +176,8 @@ def save(payload):
                 INSERT INTO rounds (
                   session_id, turn_id, model, input_tokens, output_tokens,
                   cache_read_tokens, cache_creation_tokens, duration_ms,
-                  gen_ms, ttft_ms, started_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                  gen_ms, gen_pure_ms, ttft_ms, started_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(session_id, turn_id) DO UPDATE SET
                   model=excluded.model,
                   input_tokens=excluded.input_tokens,
@@ -156,6 +186,7 @@ def save(payload):
                   cache_creation_tokens=excluded.cache_creation_tokens,
                   duration_ms=excluded.duration_ms,
                   gen_ms=excluded.gen_ms,
+                  gen_pure_ms=excluded.gen_pure_ms,
                   ttft_ms=excluded.ttft_ms,
                   started_at=excluded.started_at
                 """,
@@ -169,15 +200,70 @@ def save(payload):
                     as_int(item.get("cacheCreationTokens")),
                     as_int(item.get("durationMs")),
                     as_int(item.get("genMs")),
+                    None if item.get("genPureMs") is None else as_int(item.get("genPureMs")),
                     None if item.get("ttftMs") is None else as_int(item.get("ttftMs")),
                     as_int(item.get("startedAt")),
                 ),
             )
 
-        # 只保留最近 KEEP_SESSIONS 个会话，删除更早的会话与其轮次。
+        for item in requests:
+            conn.execute(
+                """
+                INSERT INTO requests (
+                  session_id, turn_id, step_index, model, input_tokens, output_tokens,
+                  cache_read_tokens, cache_creation_tokens, gen_ms, gen_pure_ms,
+                  ttft_ms, started_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(session_id, turn_id, step_index) DO UPDATE SET
+                  model=excluded.model,
+                  input_tokens=excluded.input_tokens,
+                  output_tokens=excluded.output_tokens,
+                  cache_read_tokens=excluded.cache_read_tokens,
+                  cache_creation_tokens=excluded.cache_creation_tokens,
+                  gen_ms=excluded.gen_ms,
+                  gen_pure_ms=excluded.gen_pure_ms,
+                  ttft_ms=excluded.ttft_ms,
+                  started_at=excluded.started_at
+                """,
+                (
+                    session_id,
+                    str(item.get("turnId") or ""),
+                    as_int(item.get("index")),
+                    str(item.get("model") or "unknown"),
+                    as_int(item.get("inputTokens")),
+                    as_int(item.get("outputTokens")),
+                    as_int(item.get("cacheReadTokens")),
+                    as_int(item.get("cacheCreationTokens")),
+                    as_int(item.get("genMs")),
+                    None if item.get("genPureMs") is None else as_int(item.get("genPureMs")),
+                    None if item.get("ttftMs") is None else as_int(item.get("ttftMs")),
+                    as_int(item.get("startedAt")),
+                ),
+            )
+
+        # 每个会话只保留最近 MAX_REQUESTS_PER_SESSION 条，删更早的。
+        conn.execute(
+            """
+            DELETE FROM requests WHERE session_id=? AND rowid NOT IN (
+              SELECT rowid FROM requests WHERE session_id=?
+              ORDER BY started_at DESC, step_index DESC LIMIT ?
+            )
+            """,
+            (session_id, session_id, MAX_REQUESTS_PER_SESSION),
+        )
+
+        # 只保留最近 KEEP_SESSIONS 个会话，删除更早的会话与其轮次、请求。
         conn.execute(
             """
             DELETE FROM rounds WHERE session_id NOT IN (
+              SELECT session_id FROM sessions ORDER BY updated_at DESC LIMIT ?
+            )
+            """,
+            (KEEP_SESSIONS,),
+        )
+        conn.execute(
+            """
+            DELETE FROM requests WHERE session_id NOT IN (
               SELECT session_id FROM sessions ORDER BY updated_at DESC LIMIT ?
             )
             """,
@@ -208,6 +294,10 @@ def load(limit=20):
     for session in session_rows:
         round_rows = conn.execute(
             "SELECT * FROM rounds WHERE session_id=? ORDER BY started_at ASC",
+            (session["session_id"],),
+        ).fetchall()
+        request_rows = conn.execute(
+            "SELECT * FROM requests WHERE session_id=? ORDER BY started_at ASC, step_index ASC",
             (session["session_id"],),
         ).fetchall()
         try:
@@ -248,10 +338,27 @@ def load(limit=20):
                         "cacheCreationTokens": item["cache_creation_tokens"],
                         "durationMs": item["duration_ms"],
                         "genMs": item["gen_ms"],
+                        "genPureMs": item["gen_pure_ms"],
                         "ttftMs": item["ttft_ms"],
                         "startedAt": item["started_at"],
                     }
                     for item in round_rows
+                ],
+                "requests": [
+                    {
+                        "turnId": item["turn_id"],
+                        "index": item["step_index"],
+                        "model": item["model"],
+                        "inputTokens": item["input_tokens"],
+                        "outputTokens": item["output_tokens"],
+                        "cacheReadTokens": item["cache_read_tokens"],
+                        "cacheCreationTokens": item["cache_creation_tokens"],
+                        "genMs": item["gen_ms"],
+                        "genPureMs": item["gen_pure_ms"],
+                        "ttftMs": item["ttft_ms"],
+                        "startedAt": item["started_at"],
+                    }
+                    for item in request_rows
                 ],
             }
         )
@@ -269,6 +376,7 @@ def delete(session_id):
     conn = connect()
     with conn:
         conn.execute("DELETE FROM rounds WHERE session_id=?", (session_id,))
+        conn.execute("DELETE FROM requests WHERE session_id=?", (session_id,))
         conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
     conn.close()
     return {"ok": True, "deleted": session_id}

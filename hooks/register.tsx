@@ -45,6 +45,7 @@ const totals = atom(
     requests: 0,
     turns: 0,
     genMs: 0,
+    genPureMs: 0,
     ttftTotalMs: 0,
     ttftCount: 0,
     byModel: {},
@@ -182,14 +183,39 @@ function fmtTokens(value: number): string {
   return String(Math.round(value))
 }
 
-/** 每轮真实输出速度：输出 token ÷ 纯生成耗时。 */
-function tpsOfRound(round: UsageRound): number {
-  return round.genMs > 0 ? (round.outputTokens / round.genMs) * 1000 : 0
+/**
+ * 纯生成耗时：优先用采集时记录的窗口（首个输出块到末个输出块），
+ * 旧数据没有该字段时退回完整耗时，保证旧记录仍能算出速度。
+ */
+function genPureOf(item: { genPureMs?: number; genMs: number }): number {
+  return item.genPureMs ?? item.genMs
 }
 
-/** 每个请求的真实输出速度：本次输出 token ÷ 本次纯生成耗时。 */
-function tpsOfRequest(item: UsageRequest): number {
-  return item.genMs > 0 ? (item.outputTokens / item.genMs) * 1000 : 0
+/** 统一的输出速度：输出 token ÷ 纯生成耗时；分母非正时无读数。 */
+function rateOf(outputTokens: number, genPureMs: number): number | null {
+  return genPureMs > 0 ? (outputTokens / genPureMs) * 1000 : null
+}
+
+/** 实时速率的采样点：到达时刻与当时的累计字符数。 */
+type RateSample = { at: number; chars: number }
+
+/**
+ * 滑动窗口字符速率：窗口基线到当前的字符增量 ÷ 跨度。
+ *
+ * <p>基线取窗口外最近一个采样，跨度不足 {@link RATE_MIN_SPAN_MS} 时无读数；
+ * 只反映最近一个窗口的生成速度，不受请求早期慢速段拖累。</p>
+ */
+function windowRate(samples: RateSample[], now: number, currentChars: number): number | null {
+  const base = samples[0]
+  if (!base) return null
+  const span = now - base.at
+  if (span < RATE_MIN_SPAN_MS) return null
+  return (Math.max(0, currentChars - base.chars) * 1000) / span
+}
+
+/** 每轮输出速度：输出 token ÷ 纯生成耗时。 */
+function tpsOfRound(round: UsageRound): number {
+  return rateOf(round.outputTokens, genPureOf(round)) ?? 0
 }
 
 /**
@@ -206,7 +232,10 @@ type SpeedPoint = {
   /** 该点的模型 id，用于顶部读数右侧的模型名。 */
   model: string
   outputTokens: number
+  /** 生成耗时（毫秒）：请求或轮次的完整窗口，含首字等待。 */
   genMs: number
+  /** 纯生成耗时（毫秒）：排除首字等待的窗口，速度与顶部平均值都按它计算。 */
+  genPureMs: number
 }
 
 /** 缓存率：缓存读取 ÷ 输入侧总量；输入侧为 0 时返回 null（无读数）。 */
@@ -591,6 +620,8 @@ function formatElapsed(ms: number): string {
 type PendingTurn = {
   startedAt: number
   genMs: number
+  /** 各 step 纯生成窗口之和：首个输出块到末个输出块，速度口径。 */
+  genPureMs: number
   ttftMs: number | null
   model: string
   agentId?: string
@@ -647,8 +678,11 @@ const DEFAULT_REQUEST_WINDOW = 20
  * 1–2 根柱子看不出分布，也容易与轮级读数混淆；窗口配置更小时按窗口值取，避免切不过去。
  */
 const REQUEST_MIN_POINTS = 3
-/** 请求读数在状态里保留的条数上限：展示窗口从尾部截取，留出调大窗口的余量。 */
-const REQUEST_KEEP = 200
+/**
+ * 请求读数在状态里保留的条数上限：展示窗口从尾部截取，留出调大窗口的余量。
+ * 与脚本的 MAX_REQUESTS_PER_SESSION 保持一致，落库与回填才覆盖同一批数据。
+ */
+const REQUEST_KEEP = 500
 
 /** 秒阈值换算为毫秒。 */
 function latencyBoundsMs(sec: TierBounds): TierBounds {
@@ -667,6 +701,28 @@ let speedConfigIssue: string | null = null
 let requestWindow = DEFAULT_REQUEST_WINDOW
 /** 请求窗口配置无效时的回退原因，由 session.start 写调试日志。 */
 let requestWindowIssue: string | null = null
+
+/**
+ * 字符→token 的默认比例：还没有校准样本时使用。
+ *
+ * <p>取 2 而不是 3.5：模型输出以中文为主时 1 个汉字接近 1 个 token，英文约 4 字符一个
+ * token，中英混排落在 2 附近。每次请求结束都用真实 usage 校准一次，默认值只在首个
+ * 请求期间生效。</p>
+ */
+const DEFAULT_CHARS_PER_TOKEN = 2
+/** 实时速率的滑动窗口长度（毫秒）：只看最近这一段，不受请求早期慢速段拖累。 */
+const RATE_WINDOW_MS = 2000
+/** 窗口跨度下限（毫秒）：太短的窗口不显示速率，避免单块到达算出尖峰。 */
+const RATE_MIN_SPAN_MS = 200
+/** 校准所需的最小输出 token 数：样本太小时比例不可靠，跳过。 */
+const CALIB_MIN_TOKENS = 20
+/** 本会话校准出的字符→token 比例；null 表示尚无样本。热重载后从默认值重新校准。 */
+let charsPerToken: number | null = null
+
+/** 当前生效的每 token 字符数：优先用校准值，没有样本时用默认值。 */
+function charsPerTokenNow(): number {
+  return charsPerToken ?? DEFAULT_CHARS_PER_TOKEN
+}
 
 /** 延迟（毫秒）对应颜色：升序阈值左闭右开；无样本不着色。 */
 function latencyColor(ms: number | null): string | undefined {
@@ -777,6 +833,7 @@ function emptyAgent(): AgentTotals {
     requests: 0,
     turns: 0,
     genMs: 0,
+    genPureMs: 0,
     outputTokens: 0,
     inputTokens: 0,
     cacheReadTokens: 0,
@@ -793,6 +850,7 @@ function addRequest(byModel: SessionTotals['byModel'], model: string): SessionTo
     outputTokens: 0,
     requests: 0,
     genMs: 0,
+    genPureMs: 0,
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
   }
@@ -802,11 +860,13 @@ function addRequest(byModel: SessionTotals['byModel'], model: string): SessionTo
 /** 主循环轮次汇总：把一轮的真实用量并入会话累计与模型明细。 */
 function addRoundTotals(current: SessionTotals, round: UsageRound): SessionTotals {
   const key = round.model || 'unknown'
+  const pureMs = genPureOf(round)
   const prev = current.byModel[key] ?? {
     inputTokens: 0,
     outputTokens: 0,
     requests: 0,
     genMs: 0,
+    genPureMs: 0,
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
   }
@@ -818,6 +878,8 @@ function addRoundTotals(current: SessionTotals, round: UsageRound): SessionTotal
     cacheCreationTokens: current.cacheCreationTokens + round.cacheCreationTokens,
     turns: current.turns + 1,
     genMs: current.genMs + round.genMs,
+    // 纯生成耗时是速度的唯一分母；旧累计没有该字段时从 0 起算。
+    genPureMs: (current.genPureMs ?? 0) + pureMs,
     ttftTotalMs: current.ttftTotalMs + (round.ttftMs ?? 0),
     ttftCount: current.ttftCount + (round.ttftMs === null ? 0 : 1),
     byModel: {
@@ -827,6 +889,7 @@ function addRoundTotals(current: SessionTotals, round: UsageRound): SessionTotal
         outputTokens: prev.outputTokens + round.outputTokens,
         requests: prev.requests,
         genMs: prev.genMs + round.genMs,
+        genPureMs: (prev.genPureMs ?? 0) + pureMs,
         // 热重载保留的旧形状没有按模型的缓存字段，按 0 起算。
         cacheReadTokens: (prev.cacheReadTokens ?? 0) + round.cacheReadTokens,
         cacheCreationTokens: (prev.cacheCreationTokens ?? 0) + round.cacheCreationTokens,
@@ -918,6 +981,7 @@ function registerCollectors(on: On): void {
     pending.set(e.turnId, {
       startedAt,
       genMs: 0,
+      genPureMs: 0,
       ttftMs: null,
       model: '',
       agentId: e.agentId,
@@ -949,8 +1013,12 @@ function registerCollectors(on: On): void {
     const startedAt = await $.clock.now()
     let firstTextAt: number | null = null
     let firstOutputAt: number | null = null
+    // 最后一个非空输出块的到达时间：纯生成窗口的终点，比「流结束」更接近末 token。
+    let lastOutputAt: number | null = null
     let stepChars = 0
     let lastFlushAt = 0
+    // 实时速率的滑动窗口采样：只保留窗口内的点，外加窗口外最近一个作基线。
+    const samples: RateSample[] = []
     const turn = pending.get(e.turnId)
     if (turn && e.model) turn.model = e.model
 
@@ -997,13 +1065,22 @@ function registerCollectors(on: On): void {
           const now = await $.clock.now()
           // 速率分母从首个输出块到达时起算，与分子覆盖同一段 token 产出区间，不含首字前的等待。
           if (firstOutputAt === null) firstOutputAt = now
+          // 记录最后一个有内容的输出块，作为纯生成窗口的终点；空块不携带 token，跳过。
+          if (piece.length > 0) {
+            lastOutputAt = now
+            samples.push({ at: now, chars: stepChars })
+            // 只保留窗口内的采样，外加窗口外最近一个作基线。
+            while (samples.length > 2 && (samples[1]?.at ?? now) < now - RATE_WINDOW_MS) samples.shift()
+          }
           // 按时间节流：首个输出块（lastFlushAt 为 0）立即刷新，之后每 500 毫秒最多一次。
           if (now - lastFlushAt >= STATUS_FLUSH_MS) {
             lastFlushAt = now
-            const elapsed = now - firstOutputAt
-            const tps = elapsed > 0 ? stepChars / 3.5 / (elapsed / 1000) : null
+            // 实时速率 = 滑动窗口字符增量 ÷ 窗口跨度 ÷ 每 token 字符数。比例由最近完成
+            // 请求校准，首个请求期间用默认值；不再用「首块至今」的累计平均。
+            const charRate = windowRate(samples, now, stepChars)
+            const tps = charRate === null ? null : charRate / charsPerTokenNow()
             // 本轮 = 已完成步骤的真实 output_tokens + 当前步骤的估算值。
-            const roundTokens = (turn?.outputTokens ?? 0) + Math.round(stepChars / 3.5)
+            const roundTokens = (turn?.outputTokens ?? 0) + Math.round(stepChars / charsPerTokenNow())
             statusCache.lastTps = tps
             $.ui.status(
               statusText(tps, roundTokens, statusCache.sessionTokens, statusCache.contextPercent, true),
@@ -1011,8 +1088,12 @@ function registerCollectors(on: On): void {
           }
         } else if (chunk.kind === 'stop') {
           const endedAt = await $.clock.now()
+          // 纯生成窗口：首个输出块到最后一个有内容的输出块，排除首字等待与收尾延迟。
+          // 轮级、请求级与状态行共用这一个值，速度口径不再分叉。
+          const stepPureMs = Math.max(0, (lastOutputAt ?? endedAt) - (firstOutputAt ?? startedAt))
           if (turn) {
             turn.genMs += endedAt - startedAt
+            turn.genPureMs += stepPureMs
             if (chunk.usage) {
               turn.model = chunk.usage.model || turn.model
               turn.inputTokens += chunk.usage.input_tokens
@@ -1028,15 +1109,22 @@ function registerCollectors(on: On): void {
           // usage 或 0，两者可能有偏差，请求级以估算保证图上不出现空洞。
           if (e.agentId === undefined) {
             const usage = chunk.usage
+            // 用本次请求的真实输出校准字符→token 比例，供下一轮实时估算使用。
+            // 样本太小时比例不可靠，跳过；比例落在合理区间外时同样不改。
+            if (usage && usage.output_tokens >= CALIB_MIN_TOKENS && stepChars > 0) {
+              const ratio = stepChars / usage.output_tokens
+              if (ratio >= 0.5 && ratio <= 8) charsPerToken = ratio
+            }
             const request: UsageRequest = {
               turnId: e.turnId,
               index: e.index,
               model: usage?.model || e.model,
               inputTokens: usage?.input_tokens ?? 0,
-              outputTokens: usage?.output_tokens ?? Math.round(stepChars / 3.5),
+              outputTokens: usage?.output_tokens ?? Math.round(stepChars / charsPerTokenNow()),
               cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
               cacheCreationTokens: usage?.cache_creation_input_tokens ?? 0,
               genMs: endedAt - startedAt,
+              genPureMs: stepPureMs,
               ttftMs: firstTextAt === null ? null : firstTextAt - startedAt,
               startedAt,
             }
@@ -1077,14 +1165,19 @@ function registerCollectors(on: On): void {
             $.ui.invalidate('ui.render')
           }
 
-          // 每步结束时把最终估算值推给状态行与实时快照；分母同样从首个输出块起算。
-          const elapsed = endedAt - (firstOutputAt ?? startedAt)
-          const finalTps = elapsed > 0 && stepChars > 0 ? stepChars / 3.5 / (elapsed / 1000) : null
+          // 每步结束时把最终值推给状态行与实时快照；分母同样从首个输出块起算。
+          // 宿主已给出真实 output_tokens 时用它覆盖字符估算，状态行与面板请求统计
+          // 才收敛到同一口径；usage 缺失时才退回估算。
+          // 分母止于最后一个有内容的输出块，而不是流结束：stop 事件比末 token 晚到，
+          // 用它会低估速度。
+          const elapsed = (lastOutputAt ?? endedAt) - (firstOutputAt ?? startedAt)
+          const finalTokens = chunk.usage ? chunk.usage.output_tokens : stepChars / charsPerTokenNow()
+          const finalTps = elapsed > 0 && finalTokens > 0 ? finalTokens / (elapsed / 1000) : null
           if (finalTps !== null) {
             // usage 已并入 turn.outputTokens 时不再重复加估算；usage 缺失时才用估算补齐。
             const roundTokens = turn
-              ? turn.outputTokens + (chunk.usage ? 0 : Math.round(stepChars / 3.5))
-              : Math.round(stepChars / 3.5)
+              ? turn.outputTokens + (chunk.usage ? 0 : Math.round(stepChars / charsPerTokenNow()))
+              : Math.round(stepChars / charsPerTokenNow())
             statusCache.lastTps = finalTps
             $.ui.status(
               statusText(finalTps, roundTokens, statusCache.sessionTokens, statusCache.contextPercent, true),
@@ -1116,6 +1209,8 @@ function registerCollectors(on: On): void {
       cacheCreationTokens: usage?.cache_creation_input_tokens ?? turn?.cacheCreationTokens ?? 0,
       durationMs: e.durationMs,
       genMs: turn?.genMs ?? e.durationMs,
+      // 热重载丢失进行中的 turn 时没有纯生成窗口，留空让读取端回退到 genMs。
+      genPureMs: turn ? turn.genPureMs : undefined,
       ttftMs: turn?.ttftMs ?? null,
       startedAt: turn?.startedAt ?? endedAt - e.durationMs,
     }
@@ -1145,6 +1240,7 @@ function registerCollectors(on: On): void {
               requests: prev.requests,
               turns: prev.turns + 1,
               genMs: prev.genMs + round.genMs,
+              genPureMs: (prev.genPureMs ?? 0) + genPureOf(round),
               outputTokens: prev.outputTokens + round.outputTokens,
               inputTokens: (prev.inputTokens ?? 0) + round.inputTokens,
               cacheReadTokens: (prev.cacheReadTokens ?? 0) + round.cacheReadTokens,
@@ -1306,22 +1402,25 @@ async function pruneHistorySnapshots($: EngineInterface, sessionId: string): Pro
  * <p>以 rounds 表为准而不是 sessions 行的累计：sessions 行每次保存都用当时的内存快照
  * 覆盖，被重置过的会话累计会失真；rounds 表按 turn_id 累积，保留完整轮次。</p>
  *
- * <p>轮次与代理计数分开判断：各自为空时才从快照恢复，热重载保留了状态时不重复计数。
- * 代理计数没有宿主侧的重建来源（工作流子代理不在 {@code $.agent.list()} 中），必须随
- * 会话快照持久化。</p>
+ * <p>轮次、请求与代理计数分开判断：各自为空时才从快照恢复，热重载保留了状态时不重复
+ * 计数。请求级读数随会话落库，宽面板重启后才不用从零积累；代理计数没有宿主侧的重建
+ * 来源（工作流子代理不在 {@code $.agent.list()} 中），必须随会话快照持久化。</p>
  */
 async function restoreSessionStats(
   $: EngineInterface,
   entries: HistoryEntry[] | null,
 ): Promise<void> {
   try {
-    const [existingRounds, existingAgents] = await Promise.all([
+    const [existingRounds, existingAgents, existingRequests] = await Promise.all([
       read($, rounds),
       read($, agentTotals),
+      read($, requests),
     ])
     const needsRounds = existingRounds.length === 0
     const needsAgents = Object.keys(existingAgents).length === 0
-    if (!needsRounds && !needsAgents) return
+    // 请求级读数单独判断：重启后它可能比轮次更晚恢复，不能只看轮次是否为空。
+    const needsRequests = existingRequests.length === 0
+    if (!needsRounds && !needsAgents && !needsRequests) return
     if (!entries || entries.length === 0) return
 
     let sessionId: string
@@ -1341,6 +1440,12 @@ async function restoreSessionStats(
       await update($, totals, () => restored)
       await refreshStatus($)
       $.ui.log(`usage-toolbar: 已从数据库回填当前会话 ${entry.rounds.length} 轮`)
+    }
+
+    // 请求级读数与轮次分开恢复：宽面板按请求展示，缺了它就只能回退轮级口径。
+    if (needsRequests && entry.requests && entry.requests.length > 0) {
+      await update($, requests, () => (entry.requests ?? []).slice(-REQUEST_KEEP))
+      $.ui.log(`usage-toolbar: 已从数据库回填当前会话 ${entry.requests.length} 个请求`)
     }
 
     // 代理计数只存在快照里；重启后宿主名单无法重建工作流子代理与已回收的子代理。
@@ -1397,6 +1502,7 @@ function emptyTotals(): SessionTotals {
     requests: 0,
     turns: 0,
     genMs: 0,
+    genPureMs: 0,
     ttftTotalMs: 0,
     ttftCount: 0,
     byModel: {},
@@ -1408,11 +1514,13 @@ function totalsFromRounds(list: UsageRound[]): SessionTotals {
 
   for (const round of list) {
     const key = round.model || 'unknown'
+    const pureMs = genPureOf(round)
     const prev = result.byModel[key] ?? {
       inputTokens: 0,
       outputTokens: 0,
       requests: 0,
       genMs: 0,
+      genPureMs: 0,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
     }
@@ -1423,6 +1531,7 @@ function totalsFromRounds(list: UsageRound[]): SessionTotals {
     result.requests += 1
     result.turns += 1
     result.genMs += round.genMs
+    result.genPureMs = (result.genPureMs ?? 0) + pureMs
     result.ttftTotalMs += round.ttftMs ?? 0
     result.ttftCount += round.ttftMs === null ? 0 : 1
     result.byModel[key] = {
@@ -1430,6 +1539,7 @@ function totalsFromRounds(list: UsageRound[]): SessionTotals {
       outputTokens: prev.outputTokens + round.outputTokens,
       requests: prev.requests + 1,
       genMs: prev.genMs + round.genMs,
+      genPureMs: (prev.genPureMs ?? 0) + pureMs,
       cacheReadTokens: prev.cacheReadTokens + round.cacheReadTokens,
       cacheCreationTokens: prev.cacheCreationTokens + round.cacheCreationTokens,
     }
@@ -1522,10 +1632,11 @@ async function saveHistory($: EngineInterface): Promise<void> {
 
   try {
     const sessionId = await $.session.id()
-    const [list, current, agentMap] = await Promise.all([
+    const [list, current, agentMap, requestList] = await Promise.all([
       read($, rounds),
       read($, totals),
       read($, agentTotals),
+      read($, requests),
     ])
     // 内存轮次为空时不写库：宿主在 /rewind 后会重建会话级 state，
     // 此时写回会把该会话的累计覆盖成 0，而轮次明细仍留在表里。
@@ -1551,6 +1662,8 @@ async function saveHistory($: EngineInterface): Promise<void> {
       totals: current,
       rounds: list.slice(-100),
       agentTotals: agentMap,
+      // 请求级读数随会话落库：宽面板重启后要能回填，不能只留在会话状态里。
+      requests: requestList.slice(-REQUEST_KEEP),
       costUsd,
       contextPercent,
       updatedAt: await $.clock.now(),
@@ -2018,13 +2131,26 @@ function registerUi(on: On): void {
       // 子代理请求不进本数组。不落库，重启或 rewind 后不足 REQUEST_MIN_POINTS 条时回退
       // 轮次，避免三张图空着或只剩一两根柱子；标题会标注积累进度。
       const requestPoints: SpeedPoint[] = wide
-        ? requestList.slice(-requestWindow).map(item => ({
-            key: `${item.turnId}:${item.index}`,
-            tps: tpsOfRequest(item),
-            model: item.model,
-            outputTokens: item.outputTokens,
-            genMs: item.genMs,
-          }))
+        ? requestList.slice(-requestWindow).map(item => {
+            // 纯生成窗口 = 请求结束 − 首个 text/thinking 块，排除首字等待；
+            // 与状态行和 vLLM 的 generation_time_ms 同口径。分子用真实 output_tokens，
+            // 不再按字符估算；N 与 N−1 的差别在 N>100 时不到 1%，取 N 与参考实现一致。
+            // 优先用采集时记下的纯生成窗口（最后一个输出块 − 首个输出块）；
+            // 旧记录没有该字段时退回 genMs − ttftMs，同样排除首字等待。
+            const genPureMs = item.genPureMs ?? Math.max(0, item.genMs - (item.ttftMs ?? 0))
+            return {
+              key: `${item.turnId}:${item.index}`,
+              // 纯解码速度按 TPOT 定义用 N−1（N 个 token 之间有 N−1 个间隔）；N≤1 无间隔记 0。
+              tps:
+                item.outputTokens > 1 && genPureMs > 0
+                  ? ((item.outputTokens - 1) / genPureMs) * 1000
+                  : 0,
+              model: item.model,
+              outputTokens: item.outputTokens,
+              genMs: item.genMs,
+              genPureMs,
+            }
+          })
         : []
       // 请求级至少攒够 REQUEST_MIN_POINTS 条才切换；窗口配置更小时按窗口取，
       // 否则窗口设成 1–2 会永远停在轮级。
@@ -2039,12 +2165,15 @@ function registerUi(on: On): void {
             model: round.model,
             outputTokens: round.outputTokens,
             genMs: round.genMs,
+            // 轮次按各步纯生成窗口之和计算；旧记录没有该字段时回退完整耗时。
+            genPureMs: genPureOf(round),
           }))
       const points = useRequests ? requestPoints : roundPoints
       // 文案里的粒度词：请求级与轮级共用同一套图表，标题与说明按它切换。
       const granularity = useRequests ? '请求' : '轮'
+      // 顶部平均值与各点同口径：分母用纯生成时长之和，不再含首字等待。
       const totalOut = points.reduce((n, p) => n + p.outputTokens, 0)
-      const totalGen = points.reduce((n, p) => n + p.genMs, 0)
+      const totalGen = points.reduce((n, p) => n + p.genPureMs, 0)
       const avg = totalGen > 0 ? (totalOut / totalGen) * 1000 : null
       const latestPoint = points.length > 0 ? (points[points.length - 1] ?? null) : null
       const latest = latestPoint ? latestPoint.tps : null
@@ -2350,7 +2479,8 @@ function registerUi(on: On): void {
       const total = display.inputTokens + display.outputTokens
       const avgDuration = display.turns > 0 ? display.genMs / display.turns : 0
       const avgTtft = display.ttftCount > 0 ? display.ttftTotalMs / display.ttftCount : 0
-      const avgTps = display.genMs > 0 ? (display.outputTokens / display.genMs) * 1000 : null
+      // 平均速度与速度视图同口径：分母用纯生成耗时，旧累计没有该字段时回退完整耗时。
+      const avgTps = rateOf(display.outputTokens, display.genPureMs ?? display.genMs)
       // 缓存率：缓存读取 ÷ 输入侧总量；尚未产生输入时无读数，显示「—」。
       const cacheRate = cacheRateOf(display.inputTokens, display.cacheReadTokens, display.cacheCreationTokens)
       const cost = usage?.cost?.usd ?? null
@@ -2582,6 +2712,7 @@ function registerUi(on: On): void {
           turns: acc.turns + counted.turns,
           outputTokens: acc.outputTokens + counted.outputTokens,
           genMs: acc.genMs + counted.genMs,
+          genPureMs: acc.genPureMs + genPureOf(counted),
           inputTokens: acc.inputTokens + (counted.inputTokens ?? 0),
           cacheReadTokens: acc.cacheReadTokens + (counted.cacheReadTokens ?? 0),
           cacheCreationTokens: acc.cacheCreationTokens + (counted.cacheCreationTokens ?? 0),
@@ -2591,13 +2722,13 @@ function registerUi(on: On): void {
           turns: 0,
           outputTokens: 0,
           genMs: 0,
+          genPureMs: 0,
           inputTokens: 0,
           cacheReadTokens: 0,
           cacheCreationTokens: 0,
         },
       )
-      const unlistedTps =
-        unlistedTotals.genMs > 0 ? (unlistedTotals.outputTokens / unlistedTotals.genMs) * 1000 : null
+      const unlistedTps = rateOf(unlistedTotals.outputTokens, unlistedTotals.genPureMs)
       // 缓存率与会话页、模型明细共用 cacheRateOf 的口径；输入侧为 0 时无读数。
       const unlistedCacheRate = cacheRateOf(
         unlistedTotals.inputTokens,
@@ -2632,11 +2763,15 @@ function registerUi(on: On): void {
       const agentCacheRate = cacheRateOf(agentUsage.input, agentUsage.cacheRead, agentUsage.cacheCreation)
       const requests = agents.reduce((n, agent) => n + (maps[agent.id]?.requests ?? 0), 0)
       const turns = agents.reduce((n, agent) => n + (maps[agent.id]?.turns ?? 0), 0)
-      const genMs = agents.reduce((n, agent) => n + (maps[agent.id]?.genMs ?? 0), 0)
-      // 速度的分子必须与分母同源：genMs 来自插件的 turn.complete 累计，
+      // 速度分母统一用纯生成耗时；旧记录没有该字段时逐条回退到完整耗时。
+      const genPureMs = agents.reduce((n, agent) => {
+        const counted = maps[agent.id]
+        return n + (counted ? genPureOf(counted) : 0)
+      }, 0)
+      // 速度的分子必须与分母同源：genPureMs 来自插件的 turn.complete 累计，
       // 因此输出也取同一累计，而不是宿主 /cost 账本（后者含重试、压缩等额外请求）。
       const pluginOutput = agents.reduce((n, agent) => n + (maps[agent.id]?.outputTokens ?? 0), 0)
-      const avgTps = genMs > 0 ? (pluginOutput / genMs) * 1000 : null
+      const avgTps = rateOf(pluginOutput, genPureMs)
 
       return (
         // 与其它视图一致：纵向间距统一交给 gap，不插入空 `<Text>` 行。
@@ -2660,7 +2795,7 @@ function registerUi(on: On): void {
               <Box flexDirection="column" gap={1}>
                 {agents.map(agent => {
                   const counted = maps[agent.id]
-                  const speed = counted && counted.genMs > 0 ? (counted.outputTokens / counted.genMs) * 1000 : null
+                  const speed = counted ? rateOf(counted.outputTokens, genPureOf(counted)) : null
                   // 卡片内的输入/输出/缓存率取宿主 AgentInfo 的 usage 明细，与顶部总览同源；
                   // usage 为空（首个请求尚未被 /cost 计数）时不显示 0，按「—」表示无读数。
                   const usageRows = agent.usage ?? []
@@ -2734,7 +2869,7 @@ function registerUi(on: On): void {
                   )}
                   <Box flexDirection="column" gap={1}>
                     {items.map(([id, counted]) => {
-                      const speed = counted.genMs > 0 ? (counted.outputTokens / counted.genMs) * 1000 : null
+                      const speed = rateOf(counted.outputTokens, genPureOf(counted))
                       const rate = cacheRateOf(
                         counted.inputTokens ?? 0,
                         counted.cacheReadTokens ?? 0,

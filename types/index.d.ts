@@ -22,8 +22,10 @@ export type UsageRound = {
   cacheCreationTokens: number
   /** 整轮墙钟耗时（含工具执行间隙），来自 turn.complete。 */
   durationMs: number
-  /** 纯生成耗时：各 step 起止之差的和，用于计算真实输出速度。 */
+  /** 完整生成耗时：各 step 起止之差的和，含各步首字等待与收尾延迟。 */
   genMs: number
+  /** 纯生成耗时：各 step 首个输出块到末个输出块之和，速度口径；旧数据没有该字段，按 genMs 回退。 */
+  genPureMs?: number
   /** 首字延迟：首个文本或思考块到达时间减去请求开始时间；无文本响应为 null。 */
   ttftMs: number | null
   /** 本轮开始时间（epoch 毫秒）。 */
@@ -51,8 +53,13 @@ export type UsageRequest = {
   cacheReadTokens: number
   /** 本次请求写入提示缓存的输入 token。 */
   cacheCreationTokens: number
-  /** 本次请求的纯生成耗时（毫秒）：请求开始到流结束。 */
+  /** 本次请求的完整耗时（毫秒）：请求开始到流结束，含首字等待与收尾延迟。 */
   genMs: number
+  /**
+   * 纯生成耗时（毫秒）：首个输出块到最后一个有内容的输出块，排除首字等待与收尾延迟。
+   * 旧记录没有该字段，读取时按 genMs − ttftMs 回退。
+   */
+  genPureMs?: number
   /** 首字延迟：首个文本或思考块到达减请求开始；无文本响应为 null。 */
   ttftMs: number | null
   /** 请求开始时间（epoch 毫秒）。 */
@@ -66,6 +73,8 @@ export type ModelTotals = {
   outputTokens: number
   requests: number
   genMs: number
+  /** 该模型的纯生成耗时之和，速度口径；旧形状没有该字段，按 genMs 回退。 */
+  genPureMs?: number
   /** 该模型从提示缓存读取的输入 token 之和；热重载保留的旧形状可能缺少该字段，按 0 处理。 */
   cacheReadTokens: number
   /** 该模型写入提示缓存的输入 token 之和；热重载保留的旧形状可能缺少该字段，按 0 处理。 */
@@ -82,8 +91,10 @@ export type SessionTotals = {
   requests: number
   /** 完整轮数（turn.complete 次数）。 */
   turns: number
-  /** 累计纯生成耗时（毫秒）。 */
+  /** 累计完整生成耗时（毫秒）。 */
   genMs: number
+  /** 累计纯生成耗时（毫秒），速度口径；旧形状没有该字段，按 genMs 回退。 */
+  genPureMs?: number
   /** TTFT 累计值与样本数，用于求平均延迟。 */
   ttftTotalMs: number
   ttftCount: number
@@ -96,6 +107,8 @@ export type AgentTotals = {
   requests: number
   turns: number
   genMs: number
+  /** 纯生成耗时之和，速度口径；旧快照没有该字段，按 genMs 回退。 */
+  genPureMs?: number
   outputTokens: number
   /** 输入侧 token（未缓存输入）；旧快照没有该字段，读取时按 0 处理。 */
   inputTokens?: number
@@ -169,6 +182,8 @@ export type HistoryEntry = {
   rounds: UsageRound[]
   /** 该会话的代理计数，按 agentId 分组的请求/轮数/输出/生成耗时；旧快照没有该字段。 */
   agentTotals?: Record<string, AgentTotals>
+  /** 该会话最近的主会话请求读数，供宽面板重启后回填；旧记录没有该字段，按空处理。 */
+  requests?: UsageRequest[]
   /** 会话结束时的估算费用（USD）；宿主无账本时缺省。 */
   costUsd?: number
   /** 会话结束时的上下文占比。 */
