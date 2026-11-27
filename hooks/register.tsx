@@ -8,6 +8,7 @@ import type {
   HistoryEntry,
   SessionTotals,
   TickerState,
+  UsageRequest,
   UsageRound,
   UsageView,
 } from '../types'
@@ -22,6 +23,17 @@ const rounds = atom(
   { plugin: 'usage-toolbar', key: 'rounds' } as const,
   [] as UsageRound[],
   { shape: 'rounds-1' },
+)
+/**
+ * 主会话最近若干个模型请求的读数，供宽面板按请求展示。
+ *
+ * <p>只保留最近 200 条（配置的展示窗口从尾部截取，调大窗口仍有余量）。不写入历史快照
+ * 与数据库：重启或 rewind 后数组为空，宽面板自动回退到轮次口径，等新请求产生再恢复。</p>
+ */
+const requests = atom(
+  { plugin: 'usage-toolbar', key: 'requests' } as const,
+  [] as UsageRequest[],
+  { shape: 'requests-1' },
 )
 const totals = atom(
   { plugin: 'usage-toolbar', key: 'totals' } as const,
@@ -173,6 +185,28 @@ function fmtTokens(value: number): string {
 /** 每轮真实输出速度：输出 token ÷ 纯生成耗时。 */
 function tpsOfRound(round: UsageRound): number {
   return round.genMs > 0 ? (round.outputTokens / round.genMs) * 1000 : 0
+}
+
+/** 每个请求的真实输出速度：本次输出 token ÷ 本次纯生成耗时。 */
+function tpsOfRequest(item: UsageRequest): number {
+  return item.genMs > 0 ? (item.outputTokens / item.genMs) * 1000 : 0
+}
+
+/**
+ * 速度视图的一个读数点。
+ *
+ * <p>宽面板的点来自模型请求，窄面板与回退路径的点来自轮次；绘图与文案只认这个形状，
+ * 两种粒度共用同一套折线、柱状图与块条代码。</p>
+ */
+type SpeedPoint = {
+  /** 唯一键，用作列表 key；请求为 turnId:index，轮次为 turnId。 */
+  key: string
+  /** 该点的输出速度（t/s）。 */
+  tps: number
+  /** 该点的模型 id，用于顶部读数右侧的模型名。 */
+  model: string
+  outputTokens: number
+  genMs: number
 }
 
 /** 缓存率：缓存读取 ÷ 输入侧总量；输入侧为 0 时返回 null（无读数）。 */
@@ -606,6 +640,10 @@ const CONTEXT_BOUNDS_PERCENT: TierBounds = [40, 60, 80]
 const DEFAULT_LATENCY_BOUNDS_SEC: TierBounds = [2, 4, 8]
 /** 速度块条满格基准默认值（t/s）：达到该值点亮全部格子；可由 userConfig 覆盖。 */
 const DEFAULT_BAR_FULL_SCALE_TPS = 300
+/** 宽面板请求窗口的默认个数；可由 userConfig 的 recentRequestWindow 覆盖。 */
+const DEFAULT_REQUEST_WINDOW = 20
+/** 请求读数在状态里保留的条数上限：展示窗口从尾部截取，留出调大窗口的余量。 */
+const REQUEST_KEEP = 200
 
 /** 秒阈值换算为毫秒。 */
 function latencyBoundsMs(sec: TierBounds): TierBounds {
@@ -620,6 +658,10 @@ let latencyConfigIssue: string | null = null
 let barFullScaleTps = DEFAULT_BAR_FULL_SCALE_TPS
 /** 块条基准配置无效时的回退原因，由 session.start 写调试日志。 */
 let speedConfigIssue: string | null = null
+/** 当前生效的宽面板请求窗口（个）；register 时按 userConfig 重建，模块重载即回到默认值。 */
+let requestWindow = DEFAULT_REQUEST_WINDOW
+/** 请求窗口配置无效时的回退原因，由 session.start 写调试日志。 */
+let requestWindowIssue: string | null = null
 
 /** 延迟（毫秒）对应颜色：升序阈值左闭右开；无样本不着色。 */
 function latencyColor(ms: number | null): string | undefined {
@@ -672,6 +714,25 @@ function applySpeedConfig(options: PluginOptions): void {
   }
   barFullScaleTps = DEFAULT_BAR_FULL_SCALE_TPS
   speedConfigIssue = `块条满格基准无效（${String(raw)}），已回退默认 ${DEFAULT_BAR_FULL_SCALE_TPS} t/s`
+}
+
+/**
+ * 按 userConfig 重建宽面板请求窗口。
+ *
+ * <p>字段：recentRequestWindow（个），默认 20。缺失、非数值或非正数时回退默认值；
+ * 小于 1 按 1 处理，超过保留上限 200 时按 200 处理，避免展示窗口大于实际存下的条数。
+ * 宿主已按 number 类型校验，这里只检查业务约束。</p>
+ */
+function applyRequestWindowConfig(options: PluginOptions): void {
+  const raw = options['recentRequestWindow']
+  const value = typeof raw === 'number' ? raw : Number(raw)
+  if (Number.isFinite(value) && value > 0) {
+    requestWindow = Math.min(REQUEST_KEEP, Math.max(1, Math.round(value)))
+    requestWindowIssue = null
+    return
+  }
+  requestWindow = DEFAULT_REQUEST_WINDOW
+  requestWindowIssue = `宽面板请求窗口无效（${String(raw)}），已回退默认 ${DEFAULT_REQUEST_WINDOW} 个`
 }
 
 /**
@@ -953,6 +1014,33 @@ function registerCollectors(on: On): void {
               turn.outputTokens += chunk.usage.output_tokens
               turn.cacheReadTokens += chunk.usage.cache_read_input_tokens
               turn.cacheCreationTokens += chunk.usage.cache_creation_input_tokens
+            }
+          }
+
+          // 请求级读数：宽面板按请求展示速度，这里把每个 step 的用量与耗时单独记一条。
+          // 只记主会话请求；子代理请求由 agentTotals 单独统计，不进入请求窗口。
+          // usage 缺失（第三方网关常见）时按字符估算输出 token；轮级在同样场景改用整轮
+          // usage 或 0，两者可能有偏差，请求级以估算保证图上不出现空洞。
+          if (e.agentId === undefined) {
+            const usage = chunk.usage
+            const request: UsageRequest = {
+              turnId: e.turnId,
+              index: e.index,
+              model: usage?.model || e.model,
+              inputTokens: usage?.input_tokens ?? 0,
+              outputTokens: usage?.output_tokens ?? Math.round(stepChars / 3.5),
+              cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
+              cacheCreationTokens: usage?.cache_creation_input_tokens ?? 0,
+              genMs: endedAt - startedAt,
+              ttftMs: firstTextAt === null ? null : firstTextAt - startedAt,
+              startedAt,
+            }
+            try {
+              await update($, requests, list => [...list, request].slice(-REQUEST_KEEP))
+            } catch (error) {
+              $.ui.log(`usage-toolbar: 记录请求级用量失败 turn=${e.turnId} ${String(error)}`, {
+                to: 'debug',
+              })
             }
           }
 
@@ -1390,6 +1478,8 @@ async function resetSessionStats($: EngineInterface): Promise<void> {
   }
 
   await update($, rounds, () => [])
+  // 请求级读数属于同一份会话统计，重置时一并清空，否则宽面板会留着已删除的旧请求。
+  await update($, requests, () => [])
   await update($, totals, () => emptyTotals())
   await update($, agentTotals, () => ({}))
   // 内存已清空，界面立即收起确认态；后续删除数据库失败只提示，不回滚已清空的内存统计。
@@ -1818,6 +1908,8 @@ function registerUi(on: On): void {
     const confirmingReset = canResetSession ? await read($, resetConfirming) : false
     const confirmingClear = canClearEnhance ? await read($, clearConfirming) : false
     const list = await read($, rounds)
+    // 请求级读数只用于宽面板；不落库，重启或 rewind 后为空时由轮次数据回退。
+    const requestList = await read($, requests)
     const sum = await read($, totals)
     // 面板在 rewind 时可能一直开着；空数据同样排队一次回填。
     scheduleEmptyRestore($, list, sum)
@@ -1911,35 +2003,56 @@ function registerUi(on: On): void {
       </Box>
     )
 
-    // 生成速度视图：平均速度、档位、峰值/最低/最新与按面板宽度铺开的轮次条。
+    // 生成速度视图：平均速度、档位、峰值/最低/最新与按面板宽度铺开的读数条。
+    // 宽面板按模型请求（一轮内的一个 step）展示，窄面板按轮次：请求级能看出同一轮里
+    // 各次调用被工具间隙摊平前的真实速度；窄面板没有图表空间，轮级更易读。
     const speedView = () => {
-      // 面板够宽才画柱状图：每轮占一列，540px 画布只容得下 20 根；窄面板与终端每轮
-      // 一行，纵向可铺开 50 轮。统计窗口跟随展示窗口，顶部平均值与下方图形口径一致。
+      // 面板够宽才画图表：请求/轮次各占一列。窄面板与终端按轮次，纵向铺开 50 轮。
       const wide = e.surface !== 'terminal' && e.props.bodyColumns >= 64
-      const recent = list.slice(-(wide ? 20 : 50))
-      const totalOut = recent.reduce((n, r) => n + r.outputTokens, 0)
-      const totalGen = recent.reduce((n, r) => n + r.genMs, 0)
+      // 宽面板取最近 N 个请求（N 来自 userConfig，默认 20，上限 200）；只含主会话请求，
+      // 子代理请求不进本数组。不落库，重启或 rewind 后为空时回退轮次，避免三张图空着。
+      const requestPoints: SpeedPoint[] = wide
+        ? requestList.slice(-requestWindow).map(item => ({
+            key: `${item.turnId}:${item.index}`,
+            tps: tpsOfRequest(item),
+            model: item.model,
+            outputTokens: item.outputTokens,
+            genMs: item.genMs,
+          }))
+        : []
+      const useRequests = requestPoints.length > 0
+      // 回退轮次时宽面板与折线共用 20 轮窗口；窄面板展示最近 50 轮。
+      const roundPoints: SpeedPoint[] = useRequests
+        ? []
+        : list.slice(-(wide ? 20 : 50)).map(round => ({
+            key: round.turnId,
+            tps: tpsOfRound(round),
+            model: round.model,
+            outputTokens: round.outputTokens,
+            genMs: round.genMs,
+          }))
+      const points = useRequests ? requestPoints : roundPoints
+      // 文案里的粒度词：请求级与轮级共用同一套图表，标题与说明按它切换。
+      const granularity = useRequests ? '请求' : '轮'
+      const totalOut = points.reduce((n, p) => n + p.outputTokens, 0)
+      const totalGen = points.reduce((n, p) => n + p.genMs, 0)
       const avg = totalGen > 0 ? (totalOut / totalGen) * 1000 : null
-      const latestRound = recent.length > 0 ? (recent[recent.length - 1] ?? null) : null
-      const latest = latestRound ? tpsOfRound(latestRound) : null
-      const values = recent.map(tpsOfRound).filter(v => v > 0)
+      const latestPoint = points.length > 0 ? (points[points.length - 1] ?? null) : null
+      const latest = latestPoint ? latestPoint.tps : null
+      const values = points.map(p => p.tps).filter(v => v > 0)
       const peak = values.length > 0 ? Math.max(...values) : null
       const low = values.length > 0 ? Math.min(...values) : null
       // 档位文本与颜色分开：文本是绝对区间，颜色统一按达成满格的比例取档。
       const level = { label: tpsLabel(avg), color: speedColor(avg) }
-      const model = latestRound
-        ? clip(modelLabel(latestRound.model), Math.max(10, e.props.bodyColumns - 30))
+      const model = latestPoint
+        ? clip(modelLabel(latestPoint.model), Math.max(10, e.props.bodyColumns - 30))
         : '—'
-      const rows = recent
-      // 块条每轮一行、纵向不受画布宽度限制：宽面板与折线、柱状图共用最近 20 轮窗口，
-      // 窄面板展示最近 50 轮完整历史。
-      const barRows = wide ? rows : list.slice(-50)
       const maxTps = peak ?? 1
       // 条形区按面板可用列数分配，并给编号和数值留固定列，保证纵向扫读时数字对齐。
       const barMax = Math.max(6, e.props.bodyColumns - 20)
-      // 折线画在明细图上方：只用基础 SVG 图元，面板足够宽且至少 2 轮时才绘制；
+      // 折线画在明细图上方：只用基础 SVG 图元，面板足够宽且至少 2 个读数点时绘制；
       // 窄侧栏与终端不画折线，只保留块条或字符条，不出现半截图。
-      const trend = rows.map(tpsOfRound)
+      const trend = points.map(p => p.tps)
       const showChart = wide && trend.length >= 2
       // 图表像素宽度随面板列数增长：每列按 7.6px 保守估算（宁可略窄也不越过槽位），下界 540 保持窄面板
       // 刻度不被压缩，上界 1080 避免超宽面板把绘图区拉成细线。
@@ -1955,7 +2068,7 @@ function registerUi(on: On): void {
               bodyRows * PANE_ROW_PX -
                 SPEED_FIXED_TEXT_ROWS * PANE_ROW_PX -
                 SPEED_GAP_PX -
-                barRows.length * BAR_ROW_HEIGHT,
+                points.length * BAR_ROW_HEIGHT,
             )
           : Math.round(chartWidth * 0.93)
       // 两块图共用一份预算；上下限沿用早期口径（折线不低于 110、柱状不低于 160），
@@ -1971,7 +2084,7 @@ function registerUi(on: On): void {
       // 宽面板柱状图：与折线图共用同一份高度预算，柱色走 speedColor 的统一分档；
       // 柱高仍按图表自身峰值自适应，保留分布分辨率。
       const barsHeight = Math.min(460, Math.max(160, Math.round(svgTotal * 0.6)))
-      const barColors = rows.map(round => speedColor(tpsOfRound(round)) ?? '#17C964')
+      const barColors = points.map(p => speedColor(p.tps) ?? '#17C964')
       const barsSvg = showChart ? speedBarsSvg(trend, barColors, chartWidth, barsHeight) : ''
       // 窄面板块条：序号 2 列 + 两个间距 + 数值列，其余列给条；按 7.6px/列换算，与图表
       // 宽度同一口径。数值列按本轮读数的实际字符数取 4–6 列：常规 5 字符时条能多占约
@@ -1979,13 +2092,13 @@ function registerUi(on: On): void {
       // 数值省略 " t/s"，单位已在标题里标明。
       const valueCols = Math.max(
         4,
-        Math.min(6, barRows.reduce((n, round) => Math.max(n, tpsOfRound(round).toFixed(1).length), 3)),
+        Math.min(6, points.reduce((n, p) => Math.max(n, p.tps.toFixed(1).length), 3)),
       )
       const barRowPx = Math.max(40, Math.round((e.props.bodyColumns - (4 + valueCols)) * 7.6))
 
       return (
         <Box flexDirection="column" gap={1}>
-          <Text dimColor size="caption">当前会话 · 最近 {recent.length} 轮平均输出速度</Text>
+          <Text dimColor size="caption">当前会话 · 最近 {points.length} {granularity}平均输出速度</Text>
           {/* 主数值独占一行，单位用小字；档位与模型另起一行，避免挤在一起。 */}
           <Box flexDirection="row" alignItems="flex-end" gap={1}>
             <Text color={level.color} size="heading">
@@ -2000,55 +2113,57 @@ function registerUi(on: On): void {
           {chartSvg !== '' && SvgTag !== null && (
             <Box flexDirection="column">
               <Text size="caption" weight="bold">速度趋势</Text>
-              <Text dimColor size="caption">面积层表示相对高低，末端标注最新读数</Text>
+              <Text dimColor size="caption">
+                {useRequests ? '仅主会话请求，子代理不计入；面积层表示相对高低' : '面积层表示相对高低，末端标注最新读数'}
+              </Text>
               <SvgTag
                 source={chartSvg}
-                alt={`最近 ${trend.length} 轮生成速度趋势，最新 ${latest === null ? '—' : latest.toFixed(1)} t/s`}
+                alt={`最近 ${trend.length} ${granularity}生成速度趋势，最新 ${latest === null ? '—' : latest.toFixed(1)} t/s`}
                 width={chartWidth}
                 height={chartHeight}
               />
             </Box>
           )}
-          {/* 峰值/最低/最新并列一行，三个数值与下方轮次条、会话视图共用 speedColor 的
+          {/* 峰值/最低/最新并列一行，三个数值与下方读数条、会话视图共用 speedColor 的
               统一分档：同一读数在指标行、图表和别的视图里必须是同一个颜色。 */}
           <Box flexDirection="row" gap={2}>
             {compactMetric('峰值', peak === null ? '—' : peak.toFixed(1), speedColor(peak))}
             {compactMetric('最低', low === null ? '—' : low.toFixed(1), speedColor(low))}
             {compactMetric('最新', latest === null ? '—' : latest.toFixed(1), speedColor(latest))}
           </Box>
-          {rows.length === 0 ? (
-            <Text dimColor size="caption">还没有完成的轮次</Text>
+          {points.length === 0 ? (
+            <Text dimColor size="caption">{useRequests ? '还没有可展示的请求' : '还没有完成的轮次'}</Text>
           ) : (
             <Box flexDirection="column" gap={1}>
               {showChart && SvgTag !== null && (
-                // 宽面板保留垂直柱状图：柱顶有数值、底部有轮次序号、左侧有刻度。
+                // 宽面板保留垂直柱状图：柱顶有数值、底部有读数序号、左侧有刻度。
                 <Box flexDirection="column" gap={1}>
                   <Box flexDirection="column">
-                    <Text size="caption" weight="bold">逐轮柱状图</Text>
+                    <Text size="caption" weight="bold">逐{granularity}柱状图</Text>
                     <Text dimColor size="caption">
-                      最近 {rows.length} 轮 · 柱高按本轮峰值自适应，柱顶为精确读数，颜色按满格 {barFullScaleTps} 比例分 5 档
+                      最近 {points.length} {granularity} · 柱高按各点峰值自适应，柱顶为精确读数，颜色按满格 {barFullScaleTps} 比例分 5 档
                     </Text>
                   </Box>
                   <SvgTag
                     source={barsSvg}
-                    alt={`最近 ${rows.length} 轮生成速度柱状图，峰值 ${peak === null ? '—' : peak.toFixed(1)} t/s`}
+                    alt={`最近 ${points.length} ${granularity}生成速度柱状图，峰值 ${peak === null ? '—' : peak.toFixed(1)} t/s`}
                     width={chartWidth}
                     height={barsHeight}
                   />
                 </Box>
               )}
               {SvgTag === null ? (
-                // 终端没有 Svg 元素：退回字符条，保证每轮都有可读的数值。
+                // 终端没有 Svg 元素：退回字符条，保证每个读数点都有可读的数值。
                 <Box flexDirection="column">
-                  <Text dimColor size="caption">最近 {rows.length} 轮生成速度</Text>
-                  {rows.map((round, index) => {
-                    const tps = tpsOfRound(round)
+                  <Text dimColor size="caption">最近 {points.length} {granularity}生成速度</Text>
+                  {points.map((point, index) => {
+                    const tps = point.tps
                     // 字符条按图表峰值比长度，颜色仍走 speedColor 的统一分档；
                     // 终端是降级路径，颜色一致性优先于长度与颜色的同源。
                     const ratioColor = speedColor(tps)
                     const width = Math.max(1, Math.round((tps / maxTps) * barMax))
                     return (
-                      <Box key={round.turnId} flexDirection="row">
+                      <Box key={point.key} flexDirection="row">
                         <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')} </Text>
                         <Box width={barMax}>
                           <Text color={ratioColor}>{'█'.repeat(width)}</Text>
@@ -2060,22 +2175,23 @@ function registerUi(on: On): void {
                 </Box>
               ) : (
                 // 分格块条：序号与速率交给宿主 Text 排版，SVG 只画格子；三段各占一列，
-                // 字体度量再大也不会压住数字。宽面板与上方图表同窗口（20 轮），窄面板
-                // 展示 50 轮；标题与说明各占一行，满格基准写在说明里。数值省略 " t/s"。
+                // 字体度量再大也不会压住数字。宽面板与上方图表同窗口（N 个请求或轮次），
+                // 窄面板展示 50 轮；标题与说明各占一行，满格基准写在说明里。数值省略 " t/s"。
                 <Box flexDirection="column">
                   <Box flexDirection="column">
-                    <Text size="caption" weight="bold">逐轮明细</Text>
+                    <Text size="caption" weight="bold">逐{granularity}明细</Text>
                     <Text dimColor size="caption">
-                      最近 {barRows.length} 轮 · 条长按满格 {barFullScaleTps} t/s 比例，末格按比例部分填充
+                      最近 {points.length} {granularity}
+                      {useRequests ? '（仅主会话）' : ''} · 条长按满格 {barFullScaleTps} t/s 比例，末格按比例部分填充
                     </Text>
                   </Box>
                   <Box flexDirection="column" marginTop={1}>
-                    {barRows.map((round, index) => {
-                      const tps = tpsOfRound(round)
+                    {points.map((point, index) => {
+                      const tps = point.tps
                       // 块条与右侧读数共用统一分档色：条越长颜色越冷，一行之内不出现两套颜色。
                       const ratioColor = speedColor(tps)
                       return (
-                        <Box key={round.turnId} flexDirection="row" alignItems="center" gap={1}>
+                        <Box key={point.key} flexDirection="row" alignItems="center" gap={1}>
                           <Box width={2}>
                             <Text dimColor size="caption">{String(index + 1).padStart(2, ' ')}</Text>
                           </Box>
@@ -2087,7 +2203,7 @@ function registerUi(on: On): void {
                               barRowPx,
                               BAR_ROW_HEIGHT,
                             )}
-                            alt={`第 ${index + 1} 轮生成速度 ${tps.toFixed(1)} t/s`}
+                            alt={`第 ${index + 1} ${granularity}生成速度 ${tps.toFixed(1)} t/s`}
                             width={barRowPx}
                             height={BAR_ROW_HEIGHT}
                           />
@@ -2680,6 +2796,7 @@ export const register: Register = (on, options) => {
   // 延迟分档阈值来自 userConfig；/config 改动会重新加载模块并再次执行这里。
   applyLatencyConfig(options)
   applySpeedConfig(options)
+  applyRequestWindowConfig(options)
   applyResetConfig(options)
   registerCollectors(on)
   registerUi(on)
@@ -2726,6 +2843,9 @@ export const register: Register = (on, options) => {
     }
     if (speedConfigIssue) {
       $.ui.log(`usage-toolbar: ${speedConfigIssue}`, { to: 'debug' })
+    }
+    if (requestWindowIssue) {
+      $.ui.log(`usage-toolbar: ${requestWindowIssue}`, { to: 'debug' })
     }
     void startHistoryLoad($)
     await $.command.register({ name: 'usagebar', description: '打开用量面板' })

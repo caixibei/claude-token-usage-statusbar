@@ -30,6 +30,35 @@ export type UsageRound = {
   startedAt: number
 }
 
+/**
+ * 一个模型请求（轮次内的一个 step）的用量与耗时。
+ *
+ * <p>宽面板按请求展示速度：同一轮里的多次调用各自计算 tps，能看到被工具间隙摊平前的
+ * 真实快慢。只记录主会话请求；子代理请求由 {@link AgentTotals} 单独统计，不进入本数组。</p>
+ */
+export type UsageRequest = {
+  /** 所属轮次 id，与 turn.start、turn.complete 的 turnId 一致。 */
+  turnId: string
+  /** 该请求在轮内的序号，从 0 起；与 turnId 一起构成唯一键。 */
+  index: number
+  /** 本次请求的模型 id。 */
+  model: string
+  /** 本次请求的未缓存输入 token。 */
+  inputTokens: number
+  /** 本次请求的输出 token；宿主未回 usage 时按字符估算。 */
+  outputTokens: number
+  /** 本次请求从提示缓存读取的输入 token。 */
+  cacheReadTokens: number
+  /** 本次请求写入提示缓存的输入 token。 */
+  cacheCreationTokens: number
+  /** 本次请求的纯生成耗时（毫秒）：请求开始到流结束。 */
+  genMs: number
+  /** 首字延迟：首个文本或思考块到达减请求开始；无文本响应为 null。 */
+  ttftMs: number | null
+  /** 请求开始时间（epoch 毫秒）。 */
+  startedAt: number
+}
+
 /** 单个模型的会话累计用量。 */
 export type ModelTotals = {
   /** 该模型各请求的未缓存输入 token 之和。 */
@@ -152,6 +181,7 @@ declare module 'claude-code' {
   interface PluginState {
     'usage-toolbar': {
       rounds: Shaped<UsageRound[]>
+      requests: Shaped<UsageRequest[]>
       totals: Shaped<SessionTotals>
       agentTotals: Shaped<Record<string, AgentTotals>>
       view: Shaped<UsageView>
