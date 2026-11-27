@@ -2214,11 +2214,12 @@ function registerUi(on: On): void {
       const svgTotal = Math.min(860, Math.max(270, svgBudget))
       const chartHeight = Math.min(300, Math.max(110, Math.round(svgTotal * 0.4)))
       const chartSvg = showChart ? speedChartSvg(trend, level.color ?? '#17C964', chartWidth, chartHeight) : ''
-      // 块条长度基准来自 userConfig（默认 300 t/s）：读数按绝对比例点亮，不同轮次、
-      // 不同会话的条长才可比。早前以本轮最大值为满格基准，171 t/s 就顶格，快慢差异
-      // 被压平。峰值超过基准时按实际峰值向上取整到 100 的倍数，避免全部顶格后再次
-      // 失去分辨率。这里只决定条长；颜色统一由 speedColor 按配置的满格刻度取档。
-      const barFullScale = Math.max(barFullScaleTps, Math.ceil((peak ?? 0) / 100) * 100)
+      // 块条长度基准固定取 userConfig（默认 300 t/s）：读数按绝对比例点亮，不同轮次、
+      // 不同会话的条长才可比。峰值超过基准时一律点亮全部格子，不再按峰值上浮，
+      // 保证「满格」就是配置值本身、说明文字与条长始终同口径；代价是多个读数同时
+      // 超过基准时彼此失去分辨率，需要更细对比时调大配置值即可。
+      // 这里只决定条长；颜色统一由 speedColor 按配置的满格刻度取档。
+      const barFullScale = barFullScaleTps
       // 宽面板柱状图：与折线图共用同一份高度预算，柱色走 speedColor 的统一分档；
       // 柱高仍按图表自身峰值自适应，保留分布分辨率。
       const barsHeight = Math.min(460, Math.max(160, Math.round(svgTotal * 0.6)))

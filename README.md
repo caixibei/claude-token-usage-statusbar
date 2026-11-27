@@ -1,6 +1,6 @@
 # 📊 usage-toolbar
 
-[![Version](https://img.shields.io/badge/version-0.2.59-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.2.60-2ea44f?style=flat-square)](.claude-plugin/plugin.json)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Claude%20Desktop%20%7C%20Claude%20Code-6f42c1?style=flat-square)
 ![Type](https://img.shields.io/badge/type-Claude%20mod-ff8c00?style=flat-square)
@@ -144,7 +144,7 @@ Claude Desktop / Claude Code 的用量与提示词增强 mod：⚡ 实时生成�
 | `45–70%` | 蓝 `#3B82F6` | 135–210 |
 | `≥70%` | 紫 `#A855F7` | ≥210 |
 
-满格刻度通过 `userConfig` 的 `barFullScaleTps` 配置（默认 300），`/config` 中对应 `usage-toolbar.barFullScaleTps`，也可写入 `~/.claude/settings.json` 的 `pluginConfigs.usage-toolbar.options`。块条长度与颜色共用这个基准；峰值超过基准时，条长基准自动上浮到 100 的倍数，颜色基准保持不变。配置改动在插件重新加载后生效。
+满格刻度通过 `userConfig` 的 `barFullScaleTps` 配置（默认 300），`/config` 中对应 `usage-toolbar.barFullScaleTps`，也可写入 `~/.claude/settings.json` 的 `pluginConfigs.usage-toolbar.options`。块条长度与颜色共用这个基准；峰值超过基准时，条长一律点亮全部格子，不再上浮基准。配置改动在插件重新加载后生效。
 
 ### 🔒 重置开关
 
